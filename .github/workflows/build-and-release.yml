@@ -14,16 +14,16 @@ jobs:
       uses: newkdev/setup-depot-tools@v1.0.1
     - name: Generate build dir
       uses: ./tools/dev/v8gen.py arm64.release -vv
-    - uses: rm out/arm64.release/args.gn
+    - run: rm out/arm64.release/args.gn
     - name: Set Args Config
-      uses: cp .github/macos-arm64/args.gn out/arm64.release/args.gn
+      run: cp .github/macos-arm64/args.gn out/arm64.release/args.gn
     - name: Setup Ninja
-        uses: ashutoshvarma/setup-ninja@master
-        with:
-          version: 1.10.0
+      uses: ashutoshvarma/setup-ninja@master
+      with:
+        version: 1.10.0
     - name: Build
-      uses: ninja -C ./out/arm64.release
-     - uses: actions/upload-artifact@v2
+      run: ninja -C ./out/arm64.release
+    - uses: actions/upload-artifact@v2
       with:
         name: v8_macos_arm64
         path: out/arm64.release/
