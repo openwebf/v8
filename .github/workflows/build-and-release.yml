@@ -12,7 +12,7 @@ jobs:
       uses: newkdev/setup-depot-tools@v1.0.1
     - uses: actions/setup-python@v5
       with:
-        python-version: '3.11.7' 
+        python-version: '3.11.7'
     - name: Set up
       run: mkdir v8 && cd v8
     - run: |
@@ -25,6 +25,8 @@ jobs:
           "custom_deps": {}
         }
         ]' > .gclient
+    - run: cat .gclient
+    - run: ls -la
     - run: gclient sync && cd v8
     - name: Generate build dir
       run: ./tools/dev/v8gen.py arm64.release -vv
