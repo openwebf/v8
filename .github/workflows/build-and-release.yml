@@ -8,8 +8,6 @@ jobs:
     runs-on: macos-14
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v1
     - name: Install Depot Tools
       uses: newkdev/setup-depot-tools@v1.0.1
     - name: Set up
