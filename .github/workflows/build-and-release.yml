@@ -30,7 +30,7 @@ jobs:
       run: cd v8 && ./tools/dev/v8gen.py arm64.release -vv
     - run: cd v8 && rm ./out.gn/arm64.release/args.gn
     - run: |
-      echo 'is_component_build = true
+        echo 'is_component_build = true
           is_debug = false
           target_cpu = "arm64"
           v8_target_cpu = "arm64"
