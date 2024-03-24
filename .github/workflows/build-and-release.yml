@@ -21,7 +21,7 @@ jobs:
           "name": "v8",
           "url": "https://github.com/openwebf/v8.git",
           "deps_file": "DEPS",
-          "managed": false,
+          "managed": False,
           "custom_deps": {}
         }
         ]' > .gclient
