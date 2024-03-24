@@ -13,8 +13,6 @@ jobs:
     - uses: actions/setup-python@v5
       with:
         python-version: '3.11.7'
-    - name: Set up
-      run: mkdir v8 && cd v8
     - run: |
         echo 'solutions = [
         {
@@ -29,17 +27,30 @@ jobs:
     - run: ls -la
     - run: gclient sync && cd v8
     - name: Generate build dir
-      run: ./tools/dev/v8gen.py arm64.release -vv
-    - run: rm ./out/arm64.release/args.gn
-    - name: Set Args Config
-      run: cp .github/macos-arm64/args.gn ./out/arm64.release/args.gn
+      run: cd v8 && ./tools/dev/v8gen.py arm64.release -vv
+    - run: cd v8 && rm ./out.gn/arm64.release/args.gn
+    - run: |
+      echo 'is_component_build = true
+          is_debug = false
+          target_cpu = "arm64"
+          v8_target_cpu = "arm64"
+          use_goma = false
+          v8_enable_backtrace = true
+          v8_enable_i18n_support = false
+          v8_use_zlib = false
+          v8_enable_webassembly = false
+          v8_enable_disassembler = false
+          v8_enable_object_print = false
+          v8_enable_verify_heap = false
+          dcheck_always_on = false' > v8/out.gn/arm64.release/args.gn
+    - run: cat v8/out.gn/arm64.release/args.gn
     - name: Setup Ninja
       uses: ashutoshvarma/setup-ninja@master
       with:
         version: 1.10.0
     - name: Build
-      run: ninja -C ./out/arm64.release
+      run: ninja -C ./v8/out.gn/arm64.release
     - uses: actions/upload-artifact@v2
       with:
         name: v8_macos_arm64
-        path: out/arm64.release/
+        path: v8/out.gn/arm64.release/
