@@ -16,14 +16,14 @@ jobs:
     - name: Set up
       run: mkdir v8 && cd v8
     - run: |
-        echo '[
+        echo 'solutions = [
         {
           "name": "v8",
           "url": "https://github.com/openwebf/v8.git",
           "deps_file": "DEPS",
           "managed": False,
           "custom_deps": {}
-        }
+        },
         ]' > .gclient
     - run: cat .gclient
     - run: ls -la
