@@ -97,7 +97,7 @@ jobs:
       run: cd v8 && ./tools/dev/v8gen.py arm64.release -vv
     - run: cd v8 && rm ./out.gn/arm64.release/args.gn
     - run: |
-        echo 'is_component_build = true
+        echo 'is_component_build = false
         ios_deployment_target = 10
         is_debug = false
         target_cpu = "arm64"
@@ -177,13 +177,14 @@ jobs:
         use_goma = false
         v8_enable_backtrace = true
         v8_enable_i18n_support = false
-        v8_use_zlib = false
+        v8_use_zlib = true
         use_custom_libcxx = false
         v8_enable_i18n_support = false
         symbol_level = 0
         v8_enable_webassembly = false
         v8_enable_disassembler = false
         v8_enable_object_print = false
+        v8_enable_snapshot_compression = true
         v8_enable_verify_heap = false
         dcheck_always_on = false
         v8_enable_pointer_compression = false
@@ -217,7 +218,6 @@ jobs:
         ]
         ' > .gclient
     - run: cat .gclient
-    - run: ls -la
     - run: gclient sync && cd v8
     - name: Generate build dir
       run: python3 v8/tools/dev/v8gen.py arm64.release -vv
