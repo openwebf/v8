@@ -64,77 +64,7 @@ jobs:
           v8/out.gn/arm64.release/libv8_libplatform.dylib
           v8/out.gn/arm64.release/libthird_party_abseil-cpp_absl.dylib
           v8/out.gn/arm64.release/d8
-          v8/out.gn/arm64.release/mkgrokdump
-          v8/out.gn/arm64.release/mksnapshot
-          v8/out.gn/arm64.release/torque
-          v8/out.gn/arm64.release/torque-language-server
-  build_ios_arm64:
-    name: iOS-arm64
-    runs-on: macos-14
-
-    steps:
-    - name: Install Depot Tools
-      uses: newkdev/setup-depot-tools@v1.0.1
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.11.7'
-    - run: |
-        echo 'solutions = [
-        {
-          "name": "v8",
-          "url": "https://github.com/openwebf/v8.git",
-          "deps_file": "DEPS",
-          "managed": False,
-          "custom_deps": {}
-        },
-        ]
-        target_os = ["ios"]
-        ' > .gclient
-    - run: cat .gclient
-    - run: ls -la
-    - run: gclient sync && cd v8
-    - name: Generate build dir
-      run: cd v8 && ./tools/dev/v8gen.py arm64.release -vv
-    - run: cd v8 && rm ./out.gn/arm64.release/args.gn
-    - run: |
-        echo 'is_component_build = false
-        ios_deployment_target = 10
-        is_debug = false
-        target_cpu = "arm64"
-        target_os = "ios"
-        v8_target_cpu = "arm64"
-        use_goma = false
-        v8_enable_backtrace = true
-        v8_enable_i18n_support = false
-        v8_use_zlib = false
-        use_custom_libcxx = false
-        v8_monolithic = true
-        v8_enable_i18n_support = false
-        symbol_level = 0
-        v8_enable_webassembly = false
-        v8_enable_disassembler = false
-        v8_enable_object_print = false
-        v8_enable_verify_heap = false
-        dcheck_always_on = false
-        v8_enable_pointer_compression = false
-        v8_use_external_startup_data = false' > v8/out.gn/arm64.release/args.gn
-    - run: cat v8/out.gn/arm64.release/args.gn
-    - name: Setup Ninja
-      uses: ashutoshvarma/setup-ninja@master
-      with:
-        version: 1.10.0
-    - name: Build
-      run: ninja -C ./v8/out.gn/arm64.release
-    - run: cd v8/out.gn/ && ls -la
-    - uses: actions/upload-artifact@v2
-      with:
-        name: v8_macos_arm64
-        path: |
-          v8/out.gn/arm64.release/libv8.dylib
-          v8/out.gn/arm64.release/libv8_libbase.dylib
-          v8/out.gn/arm64.release/libv8_libplatform.dylib
-          v8/out.gn/arm64.release/libthird_party_abseil-cpp_absl.dylib
-          v8/out.gn/arm64.release/d8
+          v8/include
           v8/out.gn/arm64.release/mkgrokdump
           v8/out.gn/arm64.release/mksnapshot
           v8/out.gn/arm64.release/torque
