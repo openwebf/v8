@@ -47,7 +47,7 @@ jobs:
         v8_enable_verify_heap = false
         dcheck_always_on = false
         v8_enable_pointer_compression = false
-        v8_use_external_startup_data = false' > v8/out.gn/arm64.release/args.gn
+        v8_use_external_startup_data = true' > v8/out.gn/arm64.release/args.gn
     - run: cat v8/out.gn/arm64.release/args.gn
     - name: Setup Ninja
       uses: ashutoshvarma/setup-ninja@master
@@ -118,7 +118,7 @@ jobs:
         v8_enable_verify_heap = false
         dcheck_always_on = false
         v8_enable_pointer_compression = false
-        v8_use_external_startup_data = false' > v8/out.gn/arm64.release/args.gn
+        v8_use_external_startup_data = true' > v8/out.gn/arm64.release/args.gn
     - run: cat v8/out.gn/arm64.release/args.gn
     - name: Setup Ninja
       uses: ashutoshvarma/setup-ninja@master
@@ -170,7 +170,7 @@ jobs:
         v8_enable_verify_heap = false
         dcheck_always_on = false
         v8_enable_pointer_compression = false
-        v8_use_external_startup_data = false"@ | Out-File -FilePath v8/out.gn/arm64.release/args.gn
+        v8_use_external_startup_data = true"@ | Out-File -FilePath v8/out.gn/arm64.release/args.gn
     - name: Setup Ninja
       uses: ashutoshvarma/setup-ninja@master
       with:
