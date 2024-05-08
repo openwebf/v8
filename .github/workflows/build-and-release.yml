@@ -80,7 +80,7 @@ jobs:
         python-version: '3.11.7'
     - uses: nttld/setup-ndk@v1
       with:
-        ndk-version: r25c
+        ndk-version: r21e
     - run: |
         echo 'solutions = [
         {
