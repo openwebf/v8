@@ -80,7 +80,7 @@ jobs:
         python-version: '3.11.7'
     - uses: nttld/setup-ndk@v1
       with:
-        ndk-version: r21e
+        ndk-version: r16b
     - run: |
         echo 'solutions = [
         {
@@ -108,7 +108,6 @@ jobs:
         v8_enable_backtrace = true
         v8_enable_i18n_support = false
         v8_use_zlib = true
-        use_custom_libcxx = false
         v8_enable_i18n_support = false
         symbol_level = 0
         v8_enable_webassembly = false
