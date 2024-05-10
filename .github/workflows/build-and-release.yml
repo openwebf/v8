@@ -125,7 +125,7 @@ jobs:
         version: 1.10.0
     - name: Build
       run: ninja -C ./v8/out.gn/arm64.release
-    - run: cd v8/out.gn/ && ls -la
+    - run: cd v8/out.gn/arm64.release && ls -la
   build_windows_x86_64:
     name: windows-x64
     runs-on: windows-latest
