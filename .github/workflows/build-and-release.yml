@@ -96,23 +96,21 @@ jobs:
       run: cd v8 && ./tools/dev/v8gen.py x64.release -vv
     - run: cd v8 && rm ./out.gn/x64.release/args.gn
     - run: |
-        echo 'is_component_build = true
+        echo 'is_component_build = false
         is_debug = false
         target_cpu = "x64"
-        v8_target_cpu = "x64"
+        v8_target_cpu = ""
         use_goma = false
-        v8_enable_backtrace = true
-        v8_enable_i18n_support = false
+        v8_enable_backtrace = ""
         v8_use_zlib = false
-        use_custom_libcxx = false
         v8_enable_i18n_support = false
         symbol_level = 0
         v8_enable_webassembly = false
-        v8_enable_disassembler = false
-        v8_enable_object_print = false
-        v8_enable_verify_heap = false
+        v8_enable_disassembler = ""
+        v8_enable_object_print = ""
+        v8_enable_verify_heap = ""
         dcheck_always_on = false
-        v8_enable_pointer_compression = false
+        v8_enable_pointer_compression = ""
         v8_use_external_startup_data = true' > v8/out.gn/x64.release/args.gn
     - run: cat v8/out.gn/x64.release/args.gn
     - name: Setup Ninja
@@ -120,7 +118,7 @@ jobs:
       with:
         version: 1.10.0
     - name: Build
-      run: ninja -C ./v8/out.gn/x64.release
+      run: ninja -v -C ./v8/out.gn/x64.release
     - uses: actions/upload-artifact@v3
       with:
         name: macos_x86_64
