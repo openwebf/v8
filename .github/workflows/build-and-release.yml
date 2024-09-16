@@ -112,7 +112,7 @@ jobs:
         mac_min_system_version = "14.0"
         mac_deployment_target = "14.0"
         symbol_level = 0
-        is_clang: false
+        is_clang = false
         v8_enable_webassembly = false
         v8_enable_disassembler = false
         v8_enable_object_print = false
