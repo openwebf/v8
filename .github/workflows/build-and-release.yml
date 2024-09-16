@@ -55,7 +55,7 @@ jobs:
         version: 1.10.0
     - name: Build
       run: ninja -C ./v8/out.gn/arm64.release
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v3
       with:
         name: v8_macos_arm64
         path: |
