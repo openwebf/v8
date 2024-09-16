@@ -39,6 +39,9 @@ jobs:
         v8_enable_i18n_support = false
         v8_use_zlib = false
         use_custom_libcxx = false
+        mac_sdk_min = "14.0"
+        mac_min_system_version = "14.0"
+        mac_deployment_target = "14.0"
         v8_enable_i18n_support = false
         symbol_level = 0
         v8_enable_webassembly = false
