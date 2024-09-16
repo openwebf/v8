@@ -118,7 +118,7 @@ jobs:
         v8_monolithic = true
         dcheck_always_on = false
         v8_enable_pointer_compression = false
-        v8_use_external_startup_data = true' > v8/out.gn/x64.release/args.gn
+        v8_use_external_startup_data = false' > v8/out.gn/x64.release/args.gn
     - run: cat v8/out.gn/x64.release/args.gn
     - name: Setup Ninja
       uses: ashutoshvarma/setup-ninja@master
