@@ -96,7 +96,7 @@ jobs:
       run: cd v8 && ./tools/dev/v8gen.py x64.release -vv
     - run: cd v8 && rm ./out.gn/x64.release/args.gn
     - run: |
-        echo 'is_component_build = false
+        echo 'is_component_build = true
         is_debug = false
         target_cpu = "x64"
         v8_target_cpu = "x64"
