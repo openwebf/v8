@@ -99,7 +99,7 @@ jobs:
         echo 'is_component_build = false
         is_debug = false
         target_cpu = "x64"
-        v8_target_cpu = ""
+        v8_target_cpu = "x64"
         use_goma = false
         v8_enable_backtrace = ""
         v8_use_zlib = false
