@@ -98,7 +98,7 @@ jobs:
       run: cd v8 && ./tools/dev/v8gen.py x64.release -vv
     - run: cd v8 && rm ./out.gn/x64.release/args.gn
     - run: |
-        echo 'is_component_build = true
+        echo 'is_component_build = false
         is_debug = false
         target_cpu = "x64"
         v8_target_cpu = "x64"
@@ -115,6 +115,7 @@ jobs:
         v8_enable_disassembler = false
         v8_enable_object_print = false
         v8_enable_verify_heap = false
+        v8_monolithic = true
         dcheck_always_on = false
         v8_enable_pointer_compression = false
         v8_use_external_startup_data = true' > v8/out.gn/x64.release/args.gn
@@ -124,7 +125,7 @@ jobs:
       with:
         version: 1.10.0
     - name: Build
-      run: ninja -C ./v8/out.gn/x64.release
+      run: ninja -C ./v8/out.gn/x64.release v8_monolith
     - uses: actions/upload-artifact@v3
       with:
         name: v8_macox_x86_64
