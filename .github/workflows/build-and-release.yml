@@ -39,6 +39,9 @@ jobs:
         v8_enable_i18n_support = false
         v8_use_zlib = false
         use_custom_libcxx = false
+        mac_sdk_min = "14.0"
+        mac_min_system_version = "14.0"
+        mac_deployment_target = "14.0"
         v8_enable_i18n_support = false
         symbol_level = 0
         v8_enable_webassembly = false
@@ -55,7 +58,7 @@ jobs:
         version: 1.10.0
     - name: Build
       run: ninja -C ./v8/out.gn/arm64.release
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v3
       with:
         name: v8_macos_arm64
         path: |
