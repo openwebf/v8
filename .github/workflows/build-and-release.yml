@@ -92,6 +92,10 @@ jobs:
     - run: cat .gclient
     - run: ls -la
     - run: gclient sync && cd v8
+    - name: Get system Clang/LLVM path
+      run: echo "CLANG_PATH=$(which clang)" >> $GITHUB_ENV
+    - name: Check system Clang version
+      run: clang --version  
     - name: Generate build dir
       run: cd v8 && ./tools/dev/v8gen.py x64.release -vv
     - run: cd v8 && rm ./out.gn/x64.release/args.gn
@@ -116,7 +120,7 @@ jobs:
         use_custom_libcxx=false 
         treat_warnings_as_errors=false 
         use_lld=false 
-        clang_base_path="/usr/local/opt/llvm"' > v8/out.gn/x64.release/args.gn
+        clang_base_path="$CLANG_PATH"' > v8/out.gn/x64.release/args.gn
     - run: cat v8/out.gn/x64.release/args.gn
     - name: Setup Ninja
       uses: ashutoshvarma/setup-ninja@master
