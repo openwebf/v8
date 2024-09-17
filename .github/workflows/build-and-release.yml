@@ -120,7 +120,7 @@ jobs:
         use_custom_libcxx=false 
         treat_warnings_as_errors=false 
         use_lld=false 
-        clang_base_path="$CLANG_PATH"' > v8/out.gn/x64.release/args.gn
+        clang_base_path="'$(which clang | xargs dirname)'"' > v8/out.gn/x64.release/args.gn
     - run: cat v8/out.gn/x64.release/args.gn
     - name: Setup Ninja
       uses: ashutoshvarma/setup-ninja@master
