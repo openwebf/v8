@@ -688,7 +688,8 @@
     # Debug configs for x64.
     'debug_x64': [
       'debug_bot', 'x64'],
-    'debug_x64_asan_turboshaft_csa': [
+
+'debug_x64_asan_turboshaft_csa': [
       'debug_bot', 'x64', 'asan', 'lsan', 'v8_enable_turboshaft_csa'],
     'debug_x64_asan_centipede': [
       'debug_bot', 'x64', 'asan', 'use_centipede'],
