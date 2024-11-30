@@ -12,6 +12,10 @@
 #include "src/base/lazy-instance.h"
 #include "src/base/logging.h"
 #include "src/base/platform/platform.h"
+#include "src/diagnostics/etw-debug-win.h"
+#include "src/diagnostics/etw-isolate-capture-state-monitor-win.h"
+#include "src/diagnostics/etw-isolate-load-script-data-win.h"
+#include "src/diagnostics/etw-isolate-operations-win.h"
 #include "src/diagnostics/etw-jit-metadata-win.h"
 #include "src/logging/log.h"
 #include "src/objects/shared-function-info.h"
@@ -22,6 +26,15 @@
 #error "This file is only compiled if v8_enable_etw_stack_walking"
 #endif
 
+#include <windows.h>
+
+#include <iostream>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+
 namespace v8 {
 namespace internal {
 namespace ETWJITInterface {
@@ -31,217 +44,19 @@ V8_DEFINE_TRACELOGGING_PROVIDER(g_v8Provider);
 
 std::atomic<bool> is_etw_enabled = false;
 
-namespace {
-
-class IsolateLoadScriptData {
- public:
-  explicit IsolateLoadScriptData(Isolate* isolate) : isolate_(isolate) {}
-  explicit IsolateLoadScriptData(IsolateLoadScriptData&& rhs) V8_NOEXCEPT {
-    isolate_ = rhs.isolate_;
-    loaded_scripts_ids_ = std::move(rhs.loaded_scripts_ids_);
-    event_id_ = rhs.event_id_.load();
-  }
-
-  static void AddIsolate(Isolate* isolate);
-  static void RemoveIsolate(Isolate* isolate);
-  static void UpdateAllIsolates(bool etw_enabled);
-  static bool MaybeAddLoadedScript(Isolate* isolate, int script_id);
-  static void EnableLog(Isolate* isolate, size_t event_id);
-  static void DisableLog(Isolate* isolate, size_t event_id);
-
-  static void EnableLogWithFilterDataOnAllIsolates(const uint8_t* data,
-                                                   size_t size);
-  static void EnableLogWithFilterData(
-      Isolate* isolate, size_t event_id,
-      const std::string& EnableLogWithFilterData);
-
- private:
-  static IsolateLoadScriptData& GetData(Isolate* isolate);
-  void EnqueueEnableLog() {
-    size_t event_id = event_id_.fetch_add(1);
-    isolate_->RequestInterrupt(
-        // Executed in the isolate thread.
-        [](v8::Isolate* v8_isolate, void* data) {
-          EnableLog(reinterpret_cast<Isolate*>(v8_isolate),
-                    reinterpret_cast<size_t>(data));
-        },
-        reinterpret_cast<void*>(event_id + 1));
-  }
-  void EnqueueDisableLog() {
-    size_t event_id = event_id_.fetch_add(1);
-    isolate_->RequestInterrupt(
-        // Executed in the isolate thread.
-        [](v8::Isolate* v8_isolate, void* data) {
-          DisableLog(reinterpret_cast<Isolate*>(v8_isolate),
-                     reinterpret_cast<size_t>(data));
-        },
-        reinterpret_cast<void*>(event_id + 1));
-  }
-
-  struct EnableWithFilterDataInterruptData {
-    size_t event_id;
-    std::string payload;
-  };
-
-  void EnqueueEnableLogWithFilterData(const std::string& etw_filter_payload) {
-    size_t event_id = event_id_.fetch_add(1);
-    isolate_->RequestInterrupt(
-        // Executed in the isolate thread.
-        [](v8::Isolate* v8_isolate, void* data) {
-          std::unique_ptr<EnableWithFilterDataInterruptData> interrupt_data(
-              reinterpret_cast<EnableWithFilterDataInterruptData*>(data));
-          size_t event_id = interrupt_data->event_id;
-          std::string etw_filter_payload = interrupt_data->payload;
-          EnableLogWithFilterData(reinterpret_cast<Isolate*>(v8_isolate),
-                                  event_id, etw_filter_payload);
-        },
-        new EnableWithFilterDataInterruptData{event_id + 1,
-                                              etw_filter_payload});
-  }
-
-  bool IsScriptLoaded(int script_id) const {
-    return loaded_scripts_ids_.find(script_id) != loaded_scripts_ids_.end();
-  }
-  void AddLoadedScript(int script_id) { loaded_scripts_ids_.insert(script_id); }
-  void RemoveAllLoadedScripts() { loaded_scripts_ids_.clear(); }
-
-  size_t CurrentEventId() const { return event_id_.load(); }
-
-  Isolate* isolate_ = nullptr;
-  std::unordered_set<int> loaded_scripts_ids_;
-  std::atomic<size_t> event_id_ = 0;
-};
-
-static base::LazyMutex isolates_mutex = LAZY_MUTEX_INITIALIZER;
-using IsolateMapType =
-    std::unordered_map<v8::internal::Isolate*, IsolateLoadScriptData>;
-static base::LazyInstance<IsolateMapType>::type isolate_map =
-    LAZY_INSTANCE_INITIALIZER;
-
-using FilterDataType = std::string;
-// Used when Isolates are created during a ETW tracing session.
-static base::LazyInstance<FilterDataType>::type etw_filter_payload =
-    LAZY_INSTANCE_INITIALIZER;
-
-// static
-IsolateLoadScriptData& IsolateLoadScriptData::GetData(Isolate* isolate) {
-  return isolate_map.Pointer()->at(isolate);
-}
-
-// static
-void IsolateLoadScriptData::AddIsolate(Isolate* isolate) {
-  base::MutexGuard guard(isolates_mutex.Pointer());
-  isolate_map.Pointer()->emplace(isolate, IsolateLoadScriptData(isolate));
-}
-
-// static
-void IsolateLoadScriptData::RemoveIsolate(Isolate* isolate) {
-  base::MutexGuard guard(isolates_mutex.Pointer());
-  isolate_map.Pointer()->erase(isolate);
-}
-
-// static
-void IsolateLoadScriptData::EnableLog(Isolate* isolate, size_t event_id) {
-  {
-    base::MutexGuard guard(isolates_mutex.Pointer());
-    auto& data = GetData(isolate);
-    if (event_id > 0 && data.CurrentEventId() != event_id) {
-      // This interrupt was canceled by a newer interrupt.
-      return;
-    }
-  }
-
-  // This cannot be done while isolate_mutex is locked, as it can call
-  // EventHandler while in the call for all the existing code.
-  isolate->v8_file_logger()->SetEtwCodeEventHandler(kJitCodeEventDefault);
-}
-
-// static
-void IsolateLoadScriptData::DisableLog(Isolate* isolate, size_t event_id) {
-  {
-    base::MutexGuard guard(isolates_mutex.Pointer());
-    auto& data = GetData(isolate);
-    if (event_id > 0 && data.CurrentEventId() != event_id) {
-      // This interrupt was canceled by a newer interrupt.
-      return;
-    }
-    data.RemoveAllLoadedScripts();
-  }
-  isolate->v8_file_logger()->ResetEtwCodeEventHandler();
-}
-
-// static
-void IsolateLoadScriptData::EnableLogWithFilterData(
-    Isolate* isolate, size_t event_id, const std::string& etw_filter_payload) {
-  {
-    base::MutexGuard guard(isolates_mutex.Pointer());
-    auto& data = GetData(isolate);
-    if (event_id > 0 && data.CurrentEventId() != event_id) {
-      // This interrupt was canceled by a newer interrupt.
-      return;
-    }
-  }
-
-  DCHECK(!etw_filter_payload.empty());
-
-  // We should not call back into V8 from the RunFilterETWSessionByURLCallback
-  // callback.
-  DisallowJavascriptExecution no_js(isolate);
-
-  if (isolate->RunFilterETWSessionByURLCallback(etw_filter_payload)) {
-    isolate->v8_file_logger()->SetEtwCodeEventHandler(kJitCodeEventDefault);
-  }
-}
-
-// static
-void IsolateLoadScriptData::EnableLogWithFilterDataOnAllIsolates(
-    const uint8_t* data, size_t size) {
-  base::MutexGuard guard(isolates_mutex.Pointer());
-  std::string etw_filter_payload;
-  etw_filter_payload.assign(data, data + size);
-  std::for_each(
-      isolate_map.Pointer()->begin(), isolate_map.Pointer()->end(),
-      [&etw_filter_payload](auto& pair) {
-        auto& isolate_data = pair.second;
-        isolate_data.EnqueueEnableLogWithFilterData(etw_filter_payload);
-      });
-}
-
-// static
-void IsolateLoadScriptData::UpdateAllIsolates(bool etw_enabled) {
-  base::MutexGuard guard(isolates_mutex.Pointer());
-  std::for_each(isolate_map.Pointer()->begin(), isolate_map.Pointer()->end(),
-                [etw_enabled](auto& pair) {
-                  auto& isolate_data = pair.second;
-                  if (etw_enabled) {
-                    isolate_data.EnqueueEnableLog();
-                  } else {
-                    isolate_data.EnqueueDisableLog();
-                  }
-                });
-}
-
-// static
-bool IsolateLoadScriptData::MaybeAddLoadedScript(Isolate* isolate,
-                                                 int script_id) {
-  base::MutexGuard guard(isolates_mutex.Pointer());
-  auto& data = GetData(isolate);
-  if (data.IsScriptLoaded(script_id)) {
-    return false;
-  }
-  data.AddLoadedScript(script_id);
-  return true;
-}
-
-}  // namespace
-
 void MaybeSetHandlerNow(Isolate* isolate) {
-  if (is_etw_enabled) {
+  ETWTRACEDBG << "MaybeSetHandlerNow called" << std::endl;
+  // Iterating read-only heap before sealed might not be safe.
+  if (is_etw_enabled &&
+      !EtwIsolateOperations::Instance()->HeapReadOnlySpaceWritable(isolate)) {
     if (etw_filter_payload.Pointer()->empty()) {
-      IsolateLoadScriptData::EnableLog(isolate, 0);
+      IsolateLoadScriptData::EnableLog(
+          isolate, 0, std::weak_ptr<EtwIsolateCaptureStateMonitor>(),
+          kJitCodeEventDefault);
     } else {
       IsolateLoadScriptData::EnableLogWithFilterData(
-          isolate, 0, *etw_filter_payload.Pointer());
+          isolate, 0, *etw_filter_payload.Pointer(),
+          std::weak_ptr<EtwIsolateCaptureStateMonitor>(), kJitCodeEventDefault);
     }
   }
 }
@@ -249,7 +64,7 @@ void MaybeSetHandlerNow(Isolate* isolate) {
 // TODO(v8/11911): UnboundScript::GetLineNumber should be replaced
 Tagged<SharedFunctionInfo> GetSharedFunctionInfo(const JitCodeEvent* event) {
   return event->script.IsEmpty() ? Tagged<SharedFunctionInfo>()
-                                 : *Utils::OpenHandle(*event->script);
+                                 : *Utils::OpenDirectHandle(*event->script);
 }
 
 std::wstring GetScriptMethodNameFromEvent(const JitCodeEvent* event) {
@@ -281,40 +96,43 @@ std::wstring GetScriptMethodName(const JitCodeEvent* event) {
                        : GetScriptMethodNameFromSharedFunctionInfo(sfi);
 }
 
-void UpdateETWEnabled(bool enabled) {
+void UpdateETWEnabled(bool enabled, uint32_t options) {
   DCHECK(v8_flags.enable_etw_stack_walking);
-  if (enabled == is_etw_enabled) {
-    return;
-  }
   is_etw_enabled = enabled;
 
-  IsolateLoadScriptData::UpdateAllIsolates(enabled);
+  IsolateLoadScriptData::UpdateAllIsolates(enabled, options);
 }
 
 // This callback is invoked by Windows every time the ETW tracing status is
 // changed for this application. As such, V8 needs to track its value for
 // knowing if the event requires us to emit JIT runtime events.
-void WINAPI ETWEnableCallback(LPCGUID /* source_id */, ULONG is_enabled,
-                              UCHAR level, ULONGLONG match_any_keyword,
-                              ULONGLONG match_all_keyword,
-                              PEVENT_FILTER_DESCRIPTOR filter_data,
-                              PVOID /* callback_context */) {
+void WINAPI V8_EXPORT_PRIVATE ETWEnableCallback(
+    LPCGUID /* source_id */, ULONG is_enabled, UCHAR level,
+    ULONGLONG match_any_keyword, ULONGLONG match_all_keyword,
+    PEVENT_FILTER_DESCRIPTOR filter_data, PVOID /* callback_context */) {
   DCHECK(v8_flags.enable_etw_stack_walking);
+  ETWTRACEDBG << "ETWEnableCallback called with is_enabled==" << is_enabled
+              << std::endl;
+
   bool is_etw_enabled_now =
       is_enabled && level >= kTraceLevel &&
       (match_any_keyword & kJScriptRuntimeKeyword) &&
       ((match_all_keyword & kJScriptRuntimeKeyword) == match_all_keyword);
+
+  uint32_t options = kJitCodeEventDefault;
+  if (is_enabled == kEtwControlCaptureState) {
+    options |= kJitCodeEventEnumExisting;
+  }
 
   FilterDataType* etw_filter = etw_filter_payload.Pointer();
 
   if (!is_etw_enabled_now || !filter_data ||
       filter_data->Type != EVENT_FILTER_TYPE_SCHEMATIZED) {
     etw_filter->clear();
-    UpdateETWEnabled(is_etw_enabled_now);
+    ETWTRACEDBG << "Enabling without filter" << std::endl;
+    UpdateETWEnabled(is_etw_enabled_now, options);
     return;
   }
-
-  if (is_etw_enabled) return;
 
   if (filter_data->Size <= sizeof(EVENT_FILTER_DESCRIPTOR)) {
     return;  // Invalid data
@@ -333,8 +151,11 @@ void WINAPI ETWEnableCallback(LPCGUID /* source_id */, ULONG is_enabled,
       filter_event_header->Size - sizeof(EVENT_FILTER_HEADER);
   etw_filter->assign(payload_start, payload_start + payload_size);
   is_etw_enabled = is_etw_enabled_now;
+
+  ETWTRACEDBG << "Enabling with filter data" << std::endl;
   IsolateLoadScriptData::EnableLogWithFilterDataOnAllIsolates(
-      reinterpret_cast<const uint8_t*>(etw_filter->data()), etw_filter->size());
+      reinterpret_cast<const uint8_t*>(etw_filter->data()), etw_filter->size(),
+      options);
 }
 
 void Register() {
@@ -346,7 +167,7 @@ void Unregister() {
   if (g_v8Provider) {
     TraceLoggingUnregister(g_v8Provider);
   }
-  UpdateETWEnabled(false);
+  UpdateETWEnabled(false, kJitCodeEventDefault);
 }
 
 void AddIsolate(Isolate* isolate) {
@@ -376,7 +197,7 @@ void EventHandler(const JitCodeEvent* event) {
 
   Tagged<SharedFunctionInfo> sfi = GetSharedFunctionInfo(event);
   if (!sfi.is_null() && IsScript(sfi->script())) {
-    Tagged<Script> script = Script::cast(sfi->script());
+    Tagged<Script> script = Cast<Script>(sfi->script());
 
     // if the first time seeing this source file, log the SourceLoad event
     script_id = script->id();
@@ -384,7 +205,7 @@ void EventHandler(const JitCodeEvent* event) {
       std::wstring wstr_name(0, L'\0');
       Tagged<Object> script_name = script->GetNameOrSourceURL();
       if (IsString(script_name)) {
-        Tagged<String> v8str_name = String::cast(script_name);
+        Tagged<String> v8str_name = Cast<String>(script_name);
         wstr_name.resize(v8str_name->length());
         // On Windows wchar_t == uint16_t. const_Cast needed for C++14.
         uint16_t* wstr_data = const_cast<uint16_t*>(
@@ -409,6 +230,44 @@ void EventHandler(const JitCodeEvent* event) {
     script->GetPositionInfo(sfi->StartPosition(), &info);
     script_line = info.line + 1;
     script_column = info.column + 1;
+  }
+
+  auto code =
+      EtwIsolateOperations::Instance()->HeapGcSafeTryFindCodeForInnerPointer(
+          isolate, Address(event->code_start));
+  if (code && code.value()->is_builtin()) {
+    bool skip_emitting_builtin = true;
+    // Skip logging functions with code kind BUILTIN as they are already present
+    // in the PDB.
+
+    // We should still emit builtin addresses if they are an interpreter
+    // trampoline.
+    if (code.value()->has_instruction_stream()) {
+      skip_emitting_builtin = false;
+
+      // The only builtin that might have instruction stream is the
+      // InterpreterEntryTrampoline builtin and only when the
+      // v8_flags.interpreted_frames_native_stack flag is enabled.
+      DCHECK_IMPLIES(
+          code.value()->is_builtin(),
+          code.value()->builtin_id() == Builtin::kInterpreterEntryTrampoline &&
+              v8_flags.interpreted_frames_native_stack);
+    } else {
+      DCHECK(code.value()->is_builtin());
+    }
+
+    // If the builtin has been relocated, we still need to emit the address
+    if (skip_emitting_builtin && V8_SHORT_BUILTIN_CALLS_BOOL &&
+        v8_flags.short_builtin_calls) {
+      CodeRange* code_range = isolate->isolate_group()->GetCodeRange();
+      if (code_range && code_range->embedded_blob_code_copy() != nullptr) {
+        skip_emitting_builtin = false;
+      }
+    }
+
+    if (skip_emitting_builtin) {
+      return;
+    }
   }
 
   constexpr static auto method_load_event_meta =

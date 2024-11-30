@@ -40,7 +40,8 @@ CallDescriptor* CreateCallDescriptor(Zone* zone, int return_count,
   for (int i = 0; i < return_count; i++) {
     builder.AddReturn(wasm::ValueType::For(type));
   }
-  return compiler::GetWasmCallDescriptor(zone, builder.Build());
+  return compiler::GetWasmCallDescriptor(zone, builder.Get(),
+                                         WasmCallKind::kWasmIndirectFunction);
 }
 
 Node* MakeConstant(RawMachineAssembler* m, MachineType type, int value) {
@@ -126,7 +127,8 @@ std::shared_ptr<wasm::NativeModule> AllocateNativeModule(Isolate* isolate,
   // WasmCallDescriptor assumes that code is on the native heap and not
   // within a code object.
   auto native_module = wasm::GetWasmEngine()->NewNativeModule(
-      isolate, wasm::WasmFeatures::All(), std::move(module), code_size);
+      isolate, wasm::WasmEnabledFeatures::All(), wasm::WasmDetectedFeatures{},
+      wasm::CompileTimeImports{}, std::move(module), code_size);
   native_module->SetWireBytes({});
   return native_module;
 }
@@ -163,11 +165,12 @@ void TestReturnMultipleValues(MachineType type, int min_count, int max_count) {
       OptimizedCompilationInfo info(base::ArrayVector("testing"),
                                     handles.main_zone(),
                                     CodeKind::WASM_FUNCTION);
-      Handle<Code> code = Pipeline::GenerateCodeForTesting(
-                              &info, handles.main_isolate(), desc, m.graph(),
-                              AssemblerOptions::Default(handles.main_isolate()),
-                              m.ExportForTest())
-                              .ToHandleChecked();
+      DirectHandle<Code> code =
+          Pipeline::GenerateCodeForTesting(
+              &info, handles.main_isolate(), desc, m.graph(),
+              AssemblerOptions::Default(handles.main_isolate()),
+              m.ExportForTest())
+              .ToHandleChecked();
 #ifdef ENABLE_DISASSEMBLER
       if (v8_flags.print_code) {
         StdoutStream os;
@@ -187,13 +190,13 @@ void TestReturnMultipleValues(MachineType type, int min_count, int max_count) {
       std::shared_ptr<wasm::NativeModule> module = AllocateNativeModule(
           handles.main_isolate(), code->instruction_size());
       wasm::WasmCodeRefScope wasm_code_ref_scope;
-      uint8_t* code_start =
-          module->AddCodeForTesting(code)->instructions().begin();
+      wasm::WasmCode* wasm_code = module->AddCodeForTesting(code);
+      WasmCodePointer code_pointer = wasm_code->code_pointer();
 
       RawMachineAssemblerTester<int32_t> mt(CodeKind::JS_TO_WASM_FUNCTION);
       const int input_count = 2 + param_count;
       Node* call_inputs[2 + kMaxParamCount];
-      call_inputs[0] = mt.PointerConstant(code_start);
+      call_inputs[0] = mt.IntPtrConstant(code_pointer);
       // WasmContext dummy
       call_inputs[1] = mt.PointerConstant(nullptr);
       // Special inputs for the test.
@@ -218,7 +221,7 @@ void TestReturnMultipleValues(MachineType type, int min_count, int max_count) {
 #ifdef ENABLE_DISASSEMBLER
       if (v8_flags.print_code) {
         StdoutStream os;
-        Handle<Code> code2 = mt.GetCode();
+        DirectHandle<Code> code2 = mt.GetCode();
         code2->Disassemble("multi_value_call", os, handles.main_isolate());
       }
 #endif
@@ -275,22 +278,23 @@ void ReturnLastValue(MachineType type) {
 
     OptimizedCompilationInfo info(base::ArrayVector("testing"),
                                   handles.main_zone(), CodeKind::WASM_FUNCTION);
-    Handle<Code> code = Pipeline::GenerateCodeForTesting(
-                            &info, handles.main_isolate(), desc, m.graph(),
-                            AssemblerOptions::Default(handles.main_isolate()),
-                            m.ExportForTest())
-                            .ToHandleChecked();
+    DirectHandle<Code> code =
+        Pipeline::GenerateCodeForTesting(
+            &info, handles.main_isolate(), desc, m.graph(),
+            AssemblerOptions::Default(handles.main_isolate()),
+            m.ExportForTest())
+            .ToHandleChecked();
 
     std::shared_ptr<wasm::NativeModule> module =
         AllocateNativeModule(handles.main_isolate(), code->instruction_size());
     wasm::WasmCodeRefScope wasm_code_ref_scope;
-    uint8_t* code_start =
-        module->AddCodeForTesting(code)->instructions().begin();
+    wasm::WasmCode* wasm_code = module->AddCodeForTesting(code);
+    WasmCodePointer code_pointer = wasm_code->code_pointer();
 
     // Generate caller.
     int expect = return_count - 1;
     RawMachineAssemblerTester<int32_t> mt;
-    Node* inputs[] = {mt.PointerConstant(code_start),
+    Node* inputs[] = {mt.IntPtrConstant(code_pointer),
                       // WasmContext dummy
                       mt.PointerConstant(nullptr)};
 
@@ -339,21 +343,22 @@ void ReturnSumOfReturns(MachineType type) {
 
     OptimizedCompilationInfo info(base::ArrayVector("testing"),
                                   handles.main_zone(), CodeKind::WASM_FUNCTION);
-    Handle<Code> code = Pipeline::GenerateCodeForTesting(
-                            &info, handles.main_isolate(), desc, m.graph(),
-                            AssemblerOptions::Default(handles.main_isolate()),
-                            m.ExportForTest())
-                            .ToHandleChecked();
+    DirectHandle<Code> code =
+        Pipeline::GenerateCodeForTesting(
+            &info, handles.main_isolate(), desc, m.graph(),
+            AssemblerOptions::Default(handles.main_isolate()),
+            m.ExportForTest())
+            .ToHandleChecked();
 
     std::shared_ptr<wasm::NativeModule> module =
         AllocateNativeModule(handles.main_isolate(), code->instruction_size());
     wasm::WasmCodeRefScope wasm_code_ref_scope;
-    uint8_t* code_start =
-        module->AddCodeForTesting(code)->instructions().begin();
+    wasm::WasmCode* wasm_code = module->AddCodeForTesting(code);
+    WasmCodePointer code_pointer = wasm_code->code_pointer();
 
     // Generate caller.
     RawMachineAssemblerTester<int32_t> mt;
-    Node* call_inputs[] = {mt.PointerConstant(code_start),
+    Node* call_inputs[] = {mt.IntPtrConstant(code_pointer),
                            // WasmContext dummy
                            mt.PointerConstant(nullptr)};
 

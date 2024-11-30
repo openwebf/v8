@@ -7,10 +7,6 @@
 
 #include "src/baseline/baseline-assembler.h"
 
-// TODO(v8:11421): Remove #if once baseline compiler is ported to other
-// architectures.
-#if ENABLE_SPARKPLUG
-
 #include <type_traits>
 #include <unordered_map>
 
@@ -114,7 +110,8 @@ void BaselineAssembler::SmiUntag(Register output, Register value) {
 
 void BaselineAssembler::LoadFixedArrayElement(Register output, Register array,
                                               int32_t index) {
-  LoadTaggedField(output, array, FixedArray::kHeaderSize + index * kTaggedSize);
+  LoadTaggedField(output, array,
+                  OFFSET_OF_DATA_START(FixedArray) + index * kTaggedSize);
 }
 
 void BaselineAssembler::LoadPrototype(Register prototype, Register object) {
@@ -174,7 +171,5 @@ EnsureAccumulatorPreservedScope::~EnsureAccumulatorPreservedScope() {
 }  // namespace baseline
 }  // namespace internal
 }  // namespace v8
-
-#endif  // ENABLE_SPARKPLUG
 
 #endif  // V8_BASELINE_BASELINE_ASSEMBLER_INL_H_

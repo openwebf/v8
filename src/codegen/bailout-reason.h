@@ -60,7 +60,6 @@ namespace internal {
   V(kOperandIsNotACode, "Operand is not a Code object")                        \
   V(kOperandIsNotAMap, "Operand is not a Map object")                          \
   V(kOperandIsNotASmi, "Operand is not a smi")                                 \
-  V(kMaglevOsrTodo, "OSR into maglev is not implemented yet")                  \
   V(kPromiseAlreadySettled, "Promise already settled")                         \
   V(kReceivedInvalidReturnAddress, "Received invalid return address")          \
   V(kRegisterDidNotMatchExpectedRoot, "Register did not match expected root")  \
@@ -91,6 +90,7 @@ namespace internal {
     "Should not return after throwing a wasm trap")                            \
   V(kUnexpectedStackPointer, "The stack pointer is not the expected value")    \
   V(kUnexpectedValue, "Unexpected value")                                      \
+  V(kUninhabitableType, "Uninhabitable type")                                  \
   V(kUnsupportedModuleOperation, "Unsupported module operation")               \
   V(kUnsupportedNonPrimitiveCompare, "Unsupported non-primitive compare")      \
   V(kWrongAddressOrValuePassedToRecordWrite,                                   \
@@ -99,10 +99,18 @@ namespace internal {
     "Wrong number of arguments for intrinsic")                                 \
   V(kWrongFunctionCodeStart, "Wrong value in code start register passed")      \
   V(kWrongFunctionContext, "Wrong context passed to function")                 \
+  V(kWrongFunctionDispatchHandle,                                              \
+    "Wrong value in dispatch handle register passed")                          \
   V(kUnexpectedThreadInWasmSet, "thread_in_wasm flag was already set")         \
   V(kUnexpectedThreadInWasmUnset, "thread_in_wasm flag was not set")           \
   V(kInvalidReceiver, "Expected JS object or primitive object")                \
-  V(kUnexpectedInstanceType, "Unexpected instance type encountered")
+  V(kUnexpectedInstanceType, "Unexpected instance type encountered")           \
+  V(kTurboshaftTypeAssertionFailed,                                            \
+    "A type assertion failed in Turboshaft-generated code")                    \
+  V(kMetadataAreaStartDoesNotMatch,                                            \
+    "The metadata doesn't belong to the chunk")                                \
+  V(kJSSignatureMismatch, "Signature mismatch during JS function call")        \
+  V(kFastCallFallbackInvalid, "Fast call fallback returned incorrect type")
 
 #define BAILOUT_MESSAGES_LIST(V)                                             \
   V(kNoReason, "no reason")                                                  \

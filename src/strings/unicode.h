@@ -140,20 +140,6 @@ class Utf16 {
 class Latin1 {
  public:
   static const uint16_t kMaxChar = 0xff;
-  // Convert the character to Latin-1 case equivalent if possible.
-  static inline uint16_t TryConvertToLatin1(uint16_t c) {
-    switch (c) {
-      // This are equivalent characters in unicode.
-      case 0x39c:
-      case 0x3bc:
-        return 0xb5;
-      // This is an uppercase of a Latin-1 character
-      // outside of Latin-1.
-      case 0x178:
-        return 0xff;
-    }
-    return c;
-  }
 };
 
 enum class Utf8Variant : uint8_t {
@@ -176,7 +162,8 @@ class V8_EXPORT_PRIVATE Utf8 {
  public:
   using State = Utf8DfaDecoder::State;
 
-  static inline uchar Length(uchar chr, int previous);
+  static inline unsigned LengthOneByte(uint8_t chr);
+  static inline unsigned Length(uchar chr, int previous);
   static inline unsigned EncodeOneByte(char* out, uint8_t c);
   static inline unsigned Encode(char* out, uchar c, int previous,
                                 bool replace_invalid = false);

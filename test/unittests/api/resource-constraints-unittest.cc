@@ -26,17 +26,19 @@ TEST(ResourceConstraints, ConfigureDefaultsFromHeapSizeLarge) {
   const size_t MB = static_cast<size_t>(i::MB);
   const size_t GB = static_cast<size_t>(i::GB);
   const size_t pm = i::Heap::kPointerMultiplier;
+  const size_t hlm = i::Heap::kHeapLimitMultiplier;
+  internal::v8_flags.scavenger_max_new_space_capacity_mb = 8;
   v8::ResourceConstraints constraints;
-  constraints.ConfigureDefaultsFromHeapSize(50u * MB, 3u * GB);
+  constraints.ConfigureDefaultsFromHeapSize(50u * MB, 2u * GB);
   // Check that for large heap sizes max semi space size is set to the maximum
   // supported capacity (i.e. 8MB with pointer compression and 16MB without;
   // MinorMS supports double capacity).
   ASSERT_EQ(internal::v8_flags.minor_ms ? 2 * i::Heap::DefaultMaxSemiSpaceSize()
-                                        : 3 * 8 * pm * MB,
+                                        : 3 * 8 / hlm * pm * MB,
             constraints.max_young_generation_size_in_bytes());
-  ASSERT_EQ(3u * GB - (internal::v8_flags.minor_ms
+  ASSERT_EQ(2u * GB - (internal::v8_flags.minor_ms
                            ? 2 * i::Heap::DefaultMaxSemiSpaceSize()
-                           : 3 * 8 * pm * MB),
+                           : 3 * 8 / hlm * pm * MB),
             constraints.max_old_generation_size_in_bytes());
   // Check that for small initial heap sizes initial semi space size is set to
   // the minimum supported capacity (i.e. 1MB with pointer compression and 512KB
@@ -57,7 +59,7 @@ TEST(ResourceConstraints, ConfigureDefaults) {
   ASSERT_EQ(512u * hlm * MB, constraints.max_old_generation_size_in_bytes());
   ASSERT_EQ(0u, constraints.initial_old_generation_size_in_bytes());
   ASSERT_EQ(internal::v8_flags.minor_ms ? 2 * i::Heap::DefaultMaxSemiSpaceSize()
-                                        : 3 * 4 * pm * MB,
+                                        : 3 * 16 / hlm * pm * MB,
             constraints.max_young_generation_size_in_bytes());
   ASSERT_EQ(0u, constraints.initial_young_generation_size_in_bytes());
 }

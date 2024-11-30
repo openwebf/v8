@@ -10,7 +10,7 @@
 #include "src/compiler/heap-refs.h"
 #include "src/compiler/node.h"
 #include "src/compiler/operator-properties.h"
-#include "src/compiler/types.h"
+#include "src/compiler/turbofan-types.h"
 
 namespace v8 {
 namespace internal {
@@ -117,9 +117,11 @@ class V8_EXPORT_PRIVATE NodeProperties {
   static bool IsPhi(Node* node) {
     return IrOpcode::IsPhiOpcode(node->opcode());
   }
+#if V8_ENABLE_WEBASSEMBLY
   static bool IsSimd128Operation(Node* node) {
     return IrOpcode::IsSimd128Opcode(node->opcode());
   }
+#endif  // V8_ENABLE_WEBASSEMBLY
 
   // Determines whether exceptions thrown by the given node are handled locally
   // within the graph (i.e. an IfException projection is present). Optionally

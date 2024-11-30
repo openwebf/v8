@@ -4,7 +4,12 @@
 
 #include "src/maglev/maglev-phi-representation-selector.h"
 
+#include <optional>
+
 #include "src/base/enum-set.h"
+#include "src/base/logging.h"
+#include "src/base/small-vector.h"
+#include "src/compiler/turboshaft/utils.h"
 #include "src/flags/flags.h"
 #include "src/handles/handles-inl.h"
 #include "src/maglev/maglev-graph-processor.h"
@@ -22,15 +27,65 @@ namespace maglev {
     }                                             \
   } while (false)
 
-ProcessResult MaglevPhiRepresentationSelector::Process(Phi* node,
-                                                       const ProcessingState&) {
-  DCHECK_EQ(node->value_representation(), ValueRepresentation::kTagged);
+BlockProcessResult MaglevPhiRepresentationSelector::PreProcessBasicBlock(
+    BasicBlock* block) {
+  PreparePhiTaggings(current_block_, block);
+  current_block_ = block;
+
+  if (block->has_phi()) {
+    auto& phis = *block->phis();
+
+    auto first_retry = phis.begin();
+    auto end_retry = first_retry;
+    bool any_change = false;
+
+    for (auto it = phis.begin(); it != phis.end(); ++it) {
+      Phi* phi = *it;
+      switch (ProcessPhi(phi)) {
+        case ProcessPhiResult::kNone:
+          break;
+        case ProcessPhiResult::kChanged:
+          any_change = true;
+          break;
+        case ProcessPhiResult::kRetryOnChange:
+          if (end_retry == first_retry) {
+            first_retry = it;
+          }
+          end_retry = it;
+          ++end_retry;
+          break;
+      }
+    }
+    // Give it one more shot in case an earlier phi has a later one as input.
+    if (any_change) {
+      for (auto it = first_retry; it != end_retry; ++it) {
+        ProcessPhi(*it);
+      }
+    }
+  }
+
+  return BlockProcessResult::kContinue;
+}
+
+bool MaglevPhiRepresentationSelector::CanHoistUntaggingTo(BasicBlock* block) {
+  if (block->successors().size() != 1) return false;
+  BasicBlock* next = block->successors()[0];
+  // To be able to hoist above resumable loops we would have to be able to
+  // convert during resumption.
+  return !next->state()->is_resumable_loop();
+}
+
+MaglevPhiRepresentationSelector::ProcessPhiResult
+MaglevPhiRepresentationSelector::ProcessPhi(Phi* node) {
+  if (node->value_representation() != ValueRepresentation::kTagged) {
+    return ProcessPhiResult::kNone;
+  }
 
   if (node->is_exception_phi()) {
     // Exception phis have no inputs (or, at least, none accessible through
     // `node->input(...)`), so we don't know if the inputs could be untagged or
     // not, so we just keep those Phis tagged.
-    return ProcessResult::kContinue;
+    return ProcessPhiResult::kNone;
   }
 
   TRACE_UNTAGGING(
@@ -39,7 +94,10 @@ ProcessResult MaglevPhiRepresentationSelector::Process(Phi* node,
   // {input_mask} represents the ValueRepresentation that {node} could have,
   // based on the ValueRepresentation of its inputs.
   ValueRepresentationSet input_reprs;
+  HoistTypeList hoist_untagging;
+  hoist_untagging.resize_and_init(node->input_count(), HoistType::kNone);
 
+  bool has_tagged_phi_input = false;
   for (int i = 0; i < node->input_count(); i++) {
     ValueNode* input = node->input(i).node();
     if (input->Is<SmiConstant>()) {
@@ -80,12 +138,57 @@ ProcessResult MaglevPhiRepresentationSelector::Process(Phi* node,
           DCHECK_EQ(i, 1);
           break;
         }
+        has_tagged_phi_input = true;
         input_reprs.RemoveAll();
         break;
       }
     } else {
-      // This input is tagged (and didn't require a tagging operation to be
-      // tagged); we won't untag {node}.
+      // This is the case where we don't have an existing conversion to attach
+      // the untagging to. In the general case we give up, however in the
+      // special case of the value originating from the loop entry branch, we
+      // can try to hoist untagging out of the loop.
+      if (builder_->graph()->is_osr() &&
+          v8_flags.maglev_hoist_osr_value_phi_untagging &&
+          input->Is<InitialValue>() &&
+          CanHoistUntaggingTo(*builder_->graph()->begin())) {
+        hoist_untagging[i] = HoistType::kPrologue;
+        continue;
+      }
+      if (node->is_loop_phi() && !node->is_backedge_offset(i)) {
+        BasicBlock* pred = node->merge_state()->predecessor_at(i);
+        if (CanHoistUntaggingTo(pred)) {
+          auto static_type = StaticTypeForNode(
+              builder_->broker(), builder_->local_isolate(), input);
+          if (NodeTypeIs(static_type, NodeType::kSmi)) {
+            input_reprs.Add(ValueRepresentation::kInt32);
+            hoist_untagging[i] = HoistType::kLoopEntryUnchecked;
+            continue;
+          }
+          if (NodeTypeIs(static_type, NodeType::kNumber)) {
+            input_reprs.Add(ValueRepresentation::kFloat64);
+            hoist_untagging[i] = HoistType::kLoopEntryUnchecked;
+            continue;
+          }
+
+          // TODO(olivf): Unless we untag OSR values, speculatively untagging
+          // could end us in deopt loops. To enable this by default we need to
+          // add some feedback to be able to back off. Or, ideally find the
+          // respective checked conversion from within the loop to wire up the
+          // feedback collection.
+          if (v8_flags.maglev_speculative_hoist_phi_untagging) {
+            // TODO(olivf): Currently there is no hard guarantee that the phi
+            // merge state has a checkpointed jump.
+            if (pred->control_node()->Is<CheckpointedJump>()) {
+              DCHECK(!node->merge_state()->is_resumable_loop());
+              hoist_untagging[i] = HoistType::kLoopEntry;
+              continue;
+            }
+          }
+        }
+      }
+
+      // This input is tagged, didn't require a tagging operation to be
+      // tagged and we decided not to hosit; we won't untag {node}.
       // TODO(dmercadier): this is a bit suboptimal, because some nodes start
       // tagged, and later become untagged (parameters for instance). Such nodes
       // will have their untagged alternative passed to {node} without any
@@ -95,6 +198,9 @@ ProcessResult MaglevPhiRepresentationSelector::Process(Phi* node,
       break;
     }
   }
+  ProcessPhiResult default_result = has_tagged_phi_input
+                                        ? ProcessPhiResult::kRetryOnChange
+                                        : ProcessPhiResult::kNone;
 
   UseRepresentationSet use_reprs;
   if (node->is_loop_phi() && !node->get_same_loop_uses_repr_hints().empty()) {
@@ -119,7 +225,7 @@ ProcessResult MaglevPhiRepresentationSelector::Process(Phi* node,
     // ignored.
     TRACE_UNTAGGING("  => Leaving tagged [incompatible uses]");
     EnsurePhiInputsTagged(node);
-    return ProcessResult::kContinue;
+    return default_result;
   }
 
   if (input_reprs.contains(ValueRepresentation::kTagged) ||
@@ -127,7 +233,7 @@ ProcessResult MaglevPhiRepresentationSelector::Process(Phi* node,
       input_reprs.empty()) {
     TRACE_UNTAGGING("  => Leaving tagged [tagged or uint32 inputs]");
     EnsurePhiInputsTagged(node);
-    return ProcessResult::kContinue;
+    return default_result;
   }
 
   // Only allowed to have Int32, Float64 and HoleyFloat64 inputs from here.
@@ -188,28 +294,37 @@ ProcessResult MaglevPhiRepresentationSelector::Process(Phi* node,
                                ValueRepresentation::kHoleyFloat64};
   }
 
+  // When hoisting we must ensure that we don't turn a tagged flowing into
+  // CheckedSmiUntag into a float64. This would cause us to loose the smi check
+  // which in turn can invalidate assumptions on aliasing values.
+  if (hoist_untagging.size() && node->uses_require_31_bit_value()) {
+    allowed_inputs_for_uses.Remove(
+        {ValueRepresentation::kFloat64, ValueRepresentation::kHoleyFloat64});
+  }
+
   auto intersection = possible_inputs & allowed_inputs_for_uses;
 
   TRACE_UNTAGGING("  + intersection reprs: " << intersection);
   if (intersection.contains(ValueRepresentation::kInt32)) {
     TRACE_UNTAGGING("  => Untagging to Int32");
-    ConvertTaggedPhiTo(node, ValueRepresentation::kInt32);
-    return ProcessResult::kContinue;
+    ConvertTaggedPhiTo(node, ValueRepresentation::kInt32, hoist_untagging);
+    return ProcessPhiResult::kChanged;
   } else if (intersection.contains(ValueRepresentation::kFloat64)) {
     TRACE_UNTAGGING("  => Untagging to kFloat64");
-    ConvertTaggedPhiTo(node, ValueRepresentation::kFloat64);
-    return ProcessResult::kContinue;
+    ConvertTaggedPhiTo(node, ValueRepresentation::kFloat64, hoist_untagging);
+    return ProcessPhiResult::kChanged;
   } else if (intersection.contains(ValueRepresentation::kHoleyFloat64)) {
     TRACE_UNTAGGING("  => Untagging to HoleyFloat64");
-    ConvertTaggedPhiTo(node, ValueRepresentation::kHoleyFloat64);
-    return ProcessResult::kContinue;
+    ConvertTaggedPhiTo(node, ValueRepresentation::kHoleyFloat64,
+                       hoist_untagging);
+    return ProcessPhiResult::kChanged;
   }
 
   DCHECK(intersection.empty());
   // We don't untag the Phi.
   TRACE_UNTAGGING("  => Leaving tagged [incompatible inputs/uses]");
   EnsurePhiInputsTagged(node);
-  return ProcessResult::kContinue;
+  return default_result;
 }
 
 void MaglevPhiRepresentationSelector::EnsurePhiInputsTagged(Phi* phi) {
@@ -222,8 +337,9 @@ void MaglevPhiRepresentationSelector::EnsurePhiInputsTagged(Phi* phi) {
   for (int i = 0; i < phi->input_count(); i++) {
     ValueNode* input = phi->input(i).node();
     if (Phi* phi_input = input->TryCast<Phi>()) {
-      phi->change_input(i, EnsurePhiTagged(phi_input, phi->predecessor_at(i),
-                                           NewNodePosition::kEnd, i));
+      phi->change_input(
+          i, EnsurePhiTagged(phi_input, phi->predecessor_at(i),
+                             NewNodePosition::kEndOfBlock, nullptr, i));
     } else {
       // Inputs of Phis that aren't Phi should always be tagged (except for the
       // phis untagged by this class, but {phi} isn't one of them).
@@ -250,7 +366,7 @@ Opcode GetOpcodeForConversion(ValueRepresentation from, ValueRepresentation to,
 
         case ValueRepresentation::kInt32:
         case ValueRepresentation::kTagged:
-        case ValueRepresentation::kWord64:
+        case ValueRepresentation::kIntPtr:
           UNREACHABLE();
       }
     case ValueRepresentation::kUint32:
@@ -264,7 +380,7 @@ Opcode GetOpcodeForConversion(ValueRepresentation from, ValueRepresentation to,
 
         case ValueRepresentation::kUint32:
         case ValueRepresentation::kTagged:
-        case ValueRepresentation::kWord64:
+        case ValueRepresentation::kIntPtr:
           UNREACHABLE();
       }
     case ValueRepresentation::kFloat64:
@@ -283,7 +399,7 @@ Opcode GetOpcodeForConversion(ValueRepresentation from, ValueRepresentation to,
 
         case ValueRepresentation::kFloat64:
         case ValueRepresentation::kTagged:
-        case ValueRepresentation::kWord64:
+        case ValueRepresentation::kIntPtr:
           UNREACHABLE();
       }
     case ValueRepresentation::kHoleyFloat64:
@@ -303,12 +419,12 @@ Opcode GetOpcodeForConversion(ValueRepresentation from, ValueRepresentation to,
 
         case ValueRepresentation::kHoleyFloat64:
         case ValueRepresentation::kTagged:
-        case ValueRepresentation::kWord64:
+        case ValueRepresentation::kIntPtr:
           UNREACHABLE();
       }
 
     case ValueRepresentation::kTagged:
-    case ValueRepresentation::kWord64:
+    case ValueRepresentation::kIntPtr:
       UNREACHABLE();
   }
   UNREACHABLE();
@@ -317,7 +433,7 @@ Opcode GetOpcodeForConversion(ValueRepresentation from, ValueRepresentation to,
 }  // namespace
 
 void MaglevPhiRepresentationSelector::ConvertTaggedPhiTo(
-    Phi* phi, ValueRepresentation repr) {
+    Phi* phi, ValueRepresentation repr, const HoistTypeList& hoist_untagging) {
   // We currently only support Int32, Float64, and HoleyFloat64 untagged phis.
   DCHECK(repr == ValueRepresentation::kInt32 ||
          repr == ValueRepresentation::kFloat64 ||
@@ -381,8 +497,7 @@ void MaglevPhiRepresentationSelector::ConvertTaggedPhiTo(
                 << ": Replacing old conversion with a ChangeInt32ToFloat64");
             ValueNode* new_node = NodeBase::New<ChangeInt32ToFloat64>(
                 builder_->zone(), {input->input(0).node()});
-            new_input = AddNode(new_node, phi->predecessor_at(i),
-                                NewNodePosition::kEnd);
+            new_input = AddNodeAtBlockEnd(new_node, phi->predecessor_at(i));
             break;
           }
           case Opcode::kIdentity:
@@ -412,23 +527,36 @@ void MaglevPhiRepresentationSelector::ConvertTaggedPhiTo(
         DCHECK(phi->is_backedge_offset(i));
 
         DeoptFrame* deopt_frame = phi->merge_state()->backedge_deopt_frame();
-        if (repr == ValueRepresentation::kInt32) {
-          phi->change_input(i, AddNode(NodeBase::New<CheckedSmiUntag>(
-                                           builder_->zone(), {input_phi}),
-                                       phi->predecessor_at(i),
-                                       NewNodePosition::kEnd, deopt_frame));
-        } else {
-          DCHECK(repr == ValueRepresentation::kFloat64 ||
-                 repr == ValueRepresentation::kHoleyFloat64);
-          TaggedToFloat64ConversionType convertion_type =
-              repr == ValueRepresentation::kFloat64
-                  ? TaggedToFloat64ConversionType::kOnlyNumber
-                  : TaggedToFloat64ConversionType::kNumberOrOddball;
-          phi->change_input(
-              i, AddNode(NodeBase::New<CheckedNumberOrOddballToFloat64>(
-                             builder_->zone(), {input_phi}, convertion_type),
-                         phi->predecessor_at(i), NewNodePosition::kEnd,
-                         deopt_frame));
+        switch (repr) {
+          case ValueRepresentation::kInt32: {
+            phi->change_input(
+                i, AddNodeAtBlockEnd(NodeBase::New<CheckedSmiUntag>(
+                                         builder_->zone(), {input_phi}),
+                                     phi->predecessor_at(i), deopt_frame));
+            break;
+          }
+          case ValueRepresentation::kFloat64: {
+            phi->change_input(
+                i, AddNodeAtBlockEnd(
+                       NodeBase::New<CheckedNumberOrOddballToFloat64>(
+                           builder_->zone(), {input_phi},
+                           TaggedToFloat64ConversionType::kOnlyNumber),
+                       phi->predecessor_at(i), deopt_frame));
+            break;
+          }
+          case ValueRepresentation::kHoleyFloat64: {
+            phi->change_input(
+                i, AddNodeAtBlockEnd(
+                       NodeBase::New<CheckedNumberOrOddballToHoleyFloat64>(
+                           builder_->zone(), {input_phi},
+                           TaggedToFloat64ConversionType::kNumberOrOddball),
+                       phi->predecessor_at(i), deopt_frame));
+            break;
+          }
+          case ValueRepresentation::kTagged:
+          case ValueRepresentation::kIntPtr:
+          case ValueRepresentation::kUint32:
+            UNREACHABLE();
         }
         TRACE_UNTAGGING(TRACE_INPUT_LABEL
                         << ": Eagerly untagging Phi on backedge");
@@ -436,13 +564,13 @@ void MaglevPhiRepresentationSelector::ConvertTaggedPhiTo(
                  from_repr == ValueRepresentation::kInt32) {
         // We allow widening of Int32 inputs to Float64, which can lead to the
         // current Phi having a Float64 representation but having some Int32
-        // inputs, which will require a Int32ToFloat64 conversion.
+        // inputs, which will require an Int32ToFloat64 conversion.
         DCHECK(repr == ValueRepresentation::kFloat64 ||
                repr == ValueRepresentation::kHoleyFloat64);
-        phi->change_input(
-            i, AddNode(NodeBase::New<ChangeInt32ToFloat64>(builder_->zone(),
-                                                           {input_phi}),
-                       phi->predecessor_at(i), NewNodePosition::kEnd));
+        phi->change_input(i,
+                          AddNodeAtBlockEnd(NodeBase::New<ChangeInt32ToFloat64>(
+                                                builder_->zone(), {input_phi}),
+                                            phi->predecessor_at(i)));
         TRACE_UNTAGGING(
             TRACE_INPUT_LABEL
             << ": Converting phi input with a ChangeInt32ToFloat64");
@@ -454,6 +582,92 @@ void MaglevPhiRepresentationSelector::ConvertTaggedPhiTo(
         TRACE_UNTAGGING(TRACE_INPUT_LABEL
                         << ": Keeping untagged Phi input as-is");
       }
+    } else if (hoist_untagging[i] != HoistType::kNone) {
+      CHECK_EQ(input->value_representation(), ValueRepresentation::kTagged);
+      BasicBlock* block;
+      DeoptFrame* deopt_frame;
+      auto GetDeoptFrame = [](BasicBlock* block) {
+        return &block->control_node()
+                    ->Cast<CheckpointedJump>()
+                    ->eager_deopt_info()
+                    ->top_frame();
+      };
+      switch (hoist_untagging[i]) {
+        case HoistType::kLoopEntryUnchecked:
+          block = phi->merge_state()->predecessor_at(i);
+          deopt_frame = nullptr;
+          break;
+        case HoistType::kLoopEntry:
+          block = phi->merge_state()->predecessor_at(i);
+          deopt_frame = GetDeoptFrame(block);
+          break;
+        case HoistType::kPrologue:
+          block = *builder_->graph()->begin();
+          deopt_frame = GetDeoptFrame(block);
+          break;
+        case HoistType::kNone:
+          UNREACHABLE();
+      }
+      // Ensure the hoisted value is actually live at the hoist location.
+      CHECK(input->Is<InitialValue>() ||
+            (phi->is_loop_phi() && !phi->is_backedge_offset(i)));
+      ValueNode* untagged;
+      switch (repr) {
+        case ValueRepresentation::kInt32:
+          if (!deopt_frame) {
+            DCHECK(
+                NodeTypeIs(StaticTypeForNode(builder_->broker(),
+                                             builder_->local_isolate(), input),
+                           NodeType::kSmi));
+            untagged = AddNodeAtBlockEnd(
+                NodeBase::New<UnsafeSmiUntag>(builder_->zone(), {input}),
+                block);
+
+          } else {
+            untagged = AddNodeAtBlockEnd(
+                NodeBase::New<CheckedNumberOrOddballToFloat64>(
+                    builder_->zone(), {input},
+                    TaggedToFloat64ConversionType::kOnlyNumber),
+                block, deopt_frame);
+            untagged =
+                AddNodeAtBlockEnd(NodeBase::New<CheckedTruncateFloat64ToInt32>(
+                                      builder_->zone(), {untagged}),
+                                  block, deopt_frame);
+          }
+          break;
+        case ValueRepresentation::kFloat64:
+        case ValueRepresentation::kHoleyFloat64:
+          if (!deopt_frame) {
+            DCHECK(
+                NodeTypeIs(StaticTypeForNode(builder_->broker(),
+                                             builder_->local_isolate(), input),
+                           NodeType::kNumber));
+            untagged = AddNodeAtBlockEnd(
+                NodeBase::New<UncheckedNumberOrOddballToFloat64>(
+                    builder_->zone(), {input},
+                    TaggedToFloat64ConversionType::kOnlyNumber),
+                block);
+          } else {
+            DCHECK(!phi->uses_require_31_bit_value());
+            untagged = AddNodeAtBlockEnd(
+                NodeBase::New<CheckedNumberOrOddballToFloat64>(
+                    builder_->zone(), {input},
+                    TaggedToFloat64ConversionType::kOnlyNumber),
+                block, deopt_frame);
+            if (repr != ValueRepresentation::kHoleyFloat64) {
+              untagged =
+                  AddNodeAtBlockEnd(NodeBase::New<CheckedHoleyFloat64ToFloat64>(
+                                        builder_->zone(), {untagged}),
+                                    block, deopt_frame);
+            }
+          }
+          break;
+        case ValueRepresentation::kTagged:
+        case ValueRepresentation::kUint32:
+        case ValueRepresentation::kIntPtr:
+          UNREACHABLE();
+      }
+      phi->change_input(i, untagged);
     } else {
       TRACE_UNTAGGING(TRACE_INPUT_LABEL << ": Invalid input for untagged phi");
       UNREACHABLE();
@@ -470,6 +684,7 @@ bool MaglevPhiRepresentationSelector::IsUntagging(Opcode op) {
     case Opcode::kTruncateNumberOrOddballToInt32:
     case Opcode::kCheckedNumberOrOddballToFloat64:
     case Opcode::kUncheckedNumberOrOddballToFloat64:
+    case Opcode::kCheckedNumberOrOddballToHoleyFloat64:
       return true;
     default:
       return false;
@@ -477,7 +692,7 @@ bool MaglevPhiRepresentationSelector::IsUntagging(Opcode op) {
 }
 
 void MaglevPhiRepresentationSelector::UpdateUntaggingOfPhi(
-    ValueNode* old_untagging) {
+    Phi* phi, ValueNode* old_untagging) {
   DCHECK_EQ(old_untagging->input_count(), 1);
   DCHECK(old_untagging->input(0).node()->Is<Phi>());
 
@@ -498,6 +713,13 @@ void MaglevPhiRepresentationSelector::UpdateUntaggingOfPhi(
   }
 
   if (from_repr == to_repr) {
+    if (from_repr == ValueRepresentation::kInt32) {
+      if (phi->uses_require_31_bit_value() &&
+          old_untagging->Is<CheckedSmiUntag>()) {
+        old_untagging->OverwriteWith<CheckedSmiSizedInt32>();
+        return;
+      }
+    }
     old_untagging->OverwriteWith<Identity>();
     return;
   }
@@ -506,7 +728,7 @@ void MaglevPhiRepresentationSelector::UpdateUntaggingOfPhi(
     // UnsafeSmiTag are only inserted when the node is a known Smi. If the
     // current phi has a Float64/Uint32 representation, then we can safely
     // truncate it to Int32, because we know that the Float64/Uint32 fits in a
-    // Smi, and therefore in a Int32.
+    // Smi, and therefore in an Int32.
     if (from_repr == ValueRepresentation::kFloat64 ||
         from_repr == ValueRepresentation::kHoleyFloat64) {
       old_untagging->OverwriteWith<UnsafeTruncateFloat64ToInt32>();
@@ -533,13 +755,24 @@ void MaglevPhiRepresentationSelector::UpdateUntaggingOfPhi(
   Opcode needed_conversion = GetOpcodeForConversion(
       from_repr, to_repr, conversion_is_truncating_float64);
 
+  if (CheckedNumberOrOddballToFloat64* number_untagging =
+          old_untagging->TryCast<CheckedNumberOrOddballToFloat64>()) {
+    if (from_repr == ValueRepresentation::kHoleyFloat64 &&
+        number_untagging->conversion_type() !=
+            TaggedToFloat64ConversionType::kNumberOrOddball) {
+      // {phi} is a HoleyFloat64 (and thus, it could be a hole), but the
+      // original untagging did not allow holes.
+      needed_conversion = Opcode::kCheckedHoleyFloat64ToFloat64;
+    }
+  }
+
   if (needed_conversion != old_untagging->opcode()) {
     old_untagging->OverwriteWith(needed_conversion);
   }
 }
 
 ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
-    CheckSmi* node, Phi* phi, int input_index, const ProcessingState& state) {
+    CheckSmi* node, Phi* phi, int input_index, const ProcessingState* state) {
   DCHECK_EQ(input_index, 0);
 
   switch (phi->value_representation()) {
@@ -560,14 +793,14 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
       return ProcessResult::kContinue;
 
     case ValueRepresentation::kUint32:
-    case ValueRepresentation::kWord64:
+    case ValueRepresentation::kIntPtr:
       UNREACHABLE();
   }
 }
 
 ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
     CheckNumber* node, Phi* phi, int input_index,
-    const ProcessingState& state) {
+    const ProcessingState* state) {
   if (phi->value_representation() != ValueRepresentation::kTagged) {
     // The phi was untagged, so we know that it's a number. We thus remove this
     // CheckNumber from the graph.
@@ -582,7 +815,7 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
 // barrier.
 ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
     StoreTaggedFieldNoWriteBarrier* node, Phi* phi, int input_index,
-    const ProcessingState& state) {
+    const ProcessingState* state) {
   if (input_index == StoreTaggedFieldNoWriteBarrier::kObjectIndex) {
     // The 1st input of a Store should usually not be untagged. However, it is
     // possible to write `let x = a ? 4 : 2; x.c = 10`, which will produce a
@@ -596,10 +829,12 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
   if (phi->value_representation() != ValueRepresentation::kTagged) {
     // We need to tag {phi}. However, this could turn it into a HeapObject
     // rather than a Smi (either because {phi} is a Float64 phi, or because it's
-    // a Int32/Uint32 phi that doesn't fit on 31 bits), so we need the write
+    // an Int32/Uint32 phi that doesn't fit on 31 bits), so we need the write
     // barrier.
-    node->change_input(input_index, EnsurePhiTagged(phi, current_block_,
-                                                    NewNodePosition::kStart));
+    node->change_input(
+        input_index,
+        EnsurePhiTagged(phi, current_block_,
+                        NewNodePosition::kBeforeCurrentNode, state));
     static_assert(StoreTaggedFieldNoWriteBarrier::kObjectIndex ==
                   StoreTaggedFieldWithWriteBarrier::kObjectIndex);
     static_assert(StoreTaggedFieldNoWriteBarrier::kValueIndex ==
@@ -615,7 +850,7 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
 // barrier.
 ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
     StoreFixedArrayElementNoWriteBarrier* node, Phi* phi, int input_index,
-    const ProcessingState& state) {
+    const ProcessingState* state) {
   if (input_index != StoreFixedArrayElementNoWriteBarrier::kValueIndex) {
     return UpdateNodePhiInput(static_cast<NodeBase*>(node), phi, input_index,
                               state);
@@ -624,10 +859,12 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
   if (phi->value_representation() != ValueRepresentation::kTagged) {
     // We need to tag {phi}. However, this could turn it into a HeapObject
     // rather than a Smi (either because {phi} is a Float64 phi, or because it's
-    // a Int32/Uint32 phi that doesn't fit on 31 bits), so we need the write
+    // an Int32/Uint32 phi that doesn't fit on 31 bits), so we need the write
     // barrier.
-    node->change_input(input_index, EnsurePhiTagged(phi, current_block_,
-                                                    NewNodePosition::kStart));
+    node->change_input(
+        input_index,
+        EnsurePhiTagged(phi, current_block_,
+                        NewNodePosition::kBeforeCurrentNode, state));
     static_assert(StoreFixedArrayElementNoWriteBarrier::kElementsIndex ==
                   StoreFixedArrayElementWithWriteBarrier::kElementsIndex);
     static_assert(StoreFixedArrayElementNoWriteBarrier::kIndexIndex ==
@@ -645,7 +882,7 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
 // avoid retagging the Phi.
 ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
     BranchIfToBooleanTrue* node, Phi* phi, int input_index,
-    const ProcessingState& state) {
+    const ProcessingState* state) {
   DCHECK_EQ(input_index, 0);
 
   switch (phi->value_representation()) {
@@ -662,7 +899,7 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
       return ProcessResult::kContinue;
 
     case ValueRepresentation::kUint32:
-    case ValueRepresentation::kWord64:
+    case ValueRepresentation::kIntPtr:
       UNREACHABLE();
   }
 }
@@ -671,7 +908,7 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
 // {phi} as a tagged value, so, if we've untagged {phi}, we need to re-tag it
 // for {node}.
 ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
-    NodeBase* node, Phi* phi, int input_index, const ProcessingState&) {
+    NodeBase* node, Phi* phi, int input_index, const ProcessingState* state) {
   if (node->properties().is_conversion()) {
     // {node} can't be an Untagging if we reached this point (because
     // UpdateNodePhiInput is not called on untagging nodes).
@@ -683,15 +920,19 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
     DCHECK_NE(phi->value_representation(), ValueRepresentation::kTagged);
     DCHECK_NE(new_nodes_.find(node), new_nodes_.end());
   } else {
-    node->change_input(input_index, EnsurePhiTagged(phi, current_block_,
-                                                    NewNodePosition::kStart));
+    node->change_input(
+        input_index,
+        EnsurePhiTagged(phi, current_block_,
+                        NewNodePosition::kBeforeCurrentNode, state));
   }
   return ProcessResult::kContinue;
 }
 
 ValueNode* MaglevPhiRepresentationSelector::EnsurePhiTagged(
     Phi* phi, BasicBlock* block, NewNodePosition pos,
-    base::Optional<int> predecessor_index) {
+    const ProcessingState* state, std::optional<int> predecessor_index) {
+  DCHECK_IMPLIES(state == nullptr, pos == NewNodePosition::kEndOfBlock);
+
   if (phi->value_representation() == ValueRepresentation::kTagged) {
     return phi;
   }
@@ -719,7 +960,7 @@ ValueNode* MaglevPhiRepresentationSelector::EnsurePhiTagged(
       tagged = AddNode(NodeBase::New<Float64ToTagged>(
                            builder_->zone(), {phi},
                            Float64ToTagged::ConversionMode::kCanonicalizeSmi),
-                       block, pos);
+                       block, pos, state);
       break;
     case ValueRepresentation::kHoleyFloat64:
       // It's important to use kCanonicalizeSmi for HoleyFloat64ToTagged, as
@@ -728,19 +969,19 @@ ValueNode* MaglevPhiRepresentationSelector::EnsurePhiTagged(
           AddNode(NodeBase::New<HoleyFloat64ToTagged>(
                       builder_->zone(), {phi},
                       HoleyFloat64ToTagged::ConversionMode::kCanonicalizeSmi),
-                  block, pos);
+                  block, pos, state);
       break;
     case ValueRepresentation::kInt32:
       tagged = AddNode(NodeBase::New<Int32ToNumber>(builder_->zone(), {phi}),
-                       block, pos);
+                       block, pos, state);
       break;
     case ValueRepresentation::kUint32:
       tagged = AddNode(NodeBase::New<Uint32ToNumber>(builder_->zone(), {phi}),
-                       block, pos);
+                       block, pos, state);
       break;
     case ValueRepresentation::kTagged:
       // Already handled at the begining of this function.
-    case ValueRepresentation::kWord64:
+    case ValueRepresentation::kIntPtr:
       UNREACHABLE();
   }
 
@@ -787,17 +1028,25 @@ void MaglevPhiRepresentationSelector::FixLoopPhisBackedge(BasicBlock* block) {
         // Since all Phi inputs are initially tagged, the fact that the backedge
         // is not tagged means that it's a Phi that we recently untagged.
         DCHECK(backedge->Is<Phi>());
-        phi->change_input(last_input_idx,
-                          EnsurePhiTagged(backedge->Cast<Phi>(), current_block_,
-                                          NewNodePosition::kEnd));
+        phi->change_input(
+            last_input_idx,
+            EnsurePhiTagged(backedge->Cast<Phi>(), current_block_,
+                            NewNodePosition::kEndOfBlock, /*state*/ nullptr));
       }
     } else {
       // If {phi} was untagged and its backedge became Identity, then we need to
       // unwrap it.
       DCHECK_NE(phi->value_representation(), ValueRepresentation::kTagged);
       if (backedge->Is<Identity>()) {
-        DCHECK_EQ(backedge->input(0).node()->value_representation(),
-                  phi->value_representation());
+        // {backedge} should have the same representation as {phi}, although if
+        // {phi} has HoleyFloat64 representation, the backedge is allowed to
+        // have Float64 representation rather than HoleyFloat64.
+        DCHECK((backedge->input(0).node()->value_representation() ==
+                phi->value_representation()) ||
+               (backedge->input(0).node()->value_representation() ==
+                    ValueRepresentation::kFloat64 &&
+                phi->value_representation() ==
+                    ValueRepresentation::kHoleyFloat64));
         phi->change_input(last_input_idx, backedge->input(0).node());
       }
     }
@@ -806,42 +1055,37 @@ void MaglevPhiRepresentationSelector::FixLoopPhisBackedge(BasicBlock* block) {
 
 template <typename DeoptInfoT>
 void MaglevPhiRepresentationSelector::BypassIdentities(DeoptInfoT* deopt_info) {
-  detail::DeepForEachInput(deopt_info,
-                           [&](ValueNode*& node, InputLocation* input) {
-                             if (node->Is<Identity>()) {
-                               node = node->input(0).node();
-                             }
-                           });
+  detail::DeepForEachInputRemovingIdentities(
+      deopt_info, [&](ValueNode* node, InputLocation* input) {});
 }
+
 template void MaglevPhiRepresentationSelector::BypassIdentities<EagerDeoptInfo>(
     EagerDeoptInfo*);
 template void MaglevPhiRepresentationSelector::BypassIdentities<LazyDeoptInfo>(
     LazyDeoptInfo*);
 
-ValueNode* MaglevPhiRepresentationSelector::AddNode(ValueNode* node,
-                                                    BasicBlock* block,
-                                                    NewNodePosition pos,
-                                                    DeoptFrame* deopt_frame) {
+ValueNode* MaglevPhiRepresentationSelector::AddNodeAtBlockEnd(
+    ValueNode* node, BasicBlock* block, DeoptFrame* deopt_frame) {
+  return AddNode(node, block, NewNodePosition::kEndOfBlock, nullptr,
+                 deopt_frame);
+}
+
+ValueNode* MaglevPhiRepresentationSelector::AddNode(
+    ValueNode* node, BasicBlock* block, NewNodePosition pos,
+    const ProcessingState* state, DeoptFrame* deopt_frame) {
   if (node->properties().can_eager_deopt()) {
     DCHECK_NOT_NULL(deopt_frame);
     node->SetEagerDeoptInfo(builder_->zone(), *deopt_frame);
   }
-  if (block == current_block_) {
-    // When adding an Node in the current block, we delay until we've finished
-    // processing the current block, to avoid mutating the list of nodes while
-    // we're iterating it.
-    if (pos == NewNodePosition::kStart) {
-      new_nodes_current_block_start_.push_back(node);
-    } else {
-      new_nodes_current_block_end_.push_back(node);
-    }
+
+  if (pos == NewNodePosition::kBeforeCurrentNode) {
+    DCHECK_EQ(block, current_block_);
+    DCHECK_NOT_NULL(state);
+    state->node_it()->InsertBefore(node);
   } else {
-    // However, when adding a node in a predecessor, the node won't be used
-    // until the current block, and it might be using nodes computed in the
-    // predecessor, so we add it at the end of the predecessor.
-    DCHECK_EQ(pos, NewNodePosition::kEnd);
     block->nodes().Add(node);
   }
+
   RegisterNewNode(node);
   return node;
 }
@@ -853,22 +1097,6 @@ void MaglevPhiRepresentationSelector::RegisterNewNode(ValueNode* node) {
 #ifdef DEBUG
   new_nodes_.insert(node);
 #endif
-}
-
-void MaglevPhiRepresentationSelector::MergeNewNodesInBlock(BasicBlock* block) {
-  if (block != nullptr && !new_nodes_current_block_start_.empty()) {
-    for (Node* node : new_nodes_current_block_start_) {
-      block->nodes().AddFront(node);
-    }
-  }
-  new_nodes_current_block_start_.clear();
-
-  if (block != nullptr && !new_nodes_current_block_end_.empty()) {
-    for (Node* node : new_nodes_current_block_end_) {
-      block->nodes().Add(node);
-    }
-  }
-  new_nodes_current_block_end_.clear();
 }
 
 void MaglevPhiRepresentationSelector::PreparePhiTaggings(

@@ -55,69 +55,90 @@ void* BoundedPageAllocator::AllocatePages(void* hint, size_t size,
   }
 
   if (address == RegionAllocator::kAllocationFailure) {
+    allocation_status_ = AllocationStatus::kRanOutOfReservation;
     return nullptr;
   }
 
   void* ptr = reinterpret_cast<void*>(address);
   // It's assumed that free regions are in kNoAccess/kNoAccessWillJitLater
   // state.
-  if (access != PageAllocator::kNoAccess &&
-      access != PageAllocator::kNoAccessWillJitLater) {
-    if (!page_allocator_->SetPermissions(ptr, size, access)) {
-      // This most likely means that we ran out of memory.
-      CHECK_EQ(region_allocator_.FreeRegion(address), size);
-      return nullptr;
+  if (access == PageAllocator::kNoAccess ||
+      access == PageAllocator::kNoAccessWillJitLater) {
+    allocation_status_ = AllocationStatus::kSuccess;
+    return ptr;
+  }
+
+  if (page_initialization_mode_ == PageInitializationMode::kRecommitOnly) {
+    if (page_allocator_->RecommitPages(ptr, size, access)) {
+      allocation_status_ = AllocationStatus::kSuccess;
+      return ptr;
+    }
+  } else {
+    if (page_allocator_->SetPermissions(ptr, size, access)) {
+      allocation_status_ = AllocationStatus::kSuccess;
+      return ptr;
     }
   }
 
-  return ptr;
+  // This most likely means that we ran out of memory.
+  CHECK_EQ(region_allocator_.FreeRegion(address), size);
+  allocation_status_ = AllocationStatus::kFailedToCommit;
+  return nullptr;
 }
 
 bool BoundedPageAllocator::AllocatePagesAt(Address address, size_t size,
                                            PageAllocator::Permission access) {
+  MutexGuard guard(&mutex_);
+
   DCHECK(IsAligned(address, allocate_page_size_));
   DCHECK(IsAligned(size, allocate_page_size_));
 
-  {
-    MutexGuard guard(&mutex_);
-    DCHECK(region_allocator_.contains(address, size));
+  DCHECK(region_allocator_.contains(address, size));
 
-    if (!region_allocator_.AllocateRegionAt(address, size)) {
-      return false;
-    }
+  if (!region_allocator_.AllocateRegionAt(address, size)) {
+    allocation_status_ = AllocationStatus::kHintedAddressTakenOrNotFound;
+    return false;
   }
 
   void* ptr = reinterpret_cast<void*>(address);
   if (!page_allocator_->SetPermissions(ptr, size, access)) {
     // This most likely means that we ran out of memory.
     CHECK_EQ(region_allocator_.FreeRegion(address), size);
+    allocation_status_ = AllocationStatus::kFailedToCommit;
     return false;
   }
 
+  allocation_status_ = AllocationStatus::kSuccess;
   return true;
 }
 
 bool BoundedPageAllocator::ReserveForSharedMemoryMapping(void* ptr,
                                                          size_t size) {
+  MutexGuard guard(&mutex_);
+
   Address address = reinterpret_cast<Address>(ptr);
   DCHECK(IsAligned(address, allocate_page_size_));
   DCHECK(IsAligned(size, commit_page_size_));
 
-  {
-    MutexGuard guard(&mutex_);
-    DCHECK(region_allocator_.contains(address, size));
+  DCHECK(region_allocator_.contains(address, size));
 
-    // Region allocator requires page size rather than commit size so just over-
-    // allocate there since any extra space couldn't be used anyway.
-    size_t region_size = RoundUp(size, allocate_page_size_);
-    if (!region_allocator_.AllocateRegionAt(
-            address, region_size, RegionAllocator::RegionState::kExcluded)) {
-      return false;
-    }
+  // Region allocator requires page size rather than commit size so just over-
+  // allocate there since any extra space couldn't be used anyway.
+  size_t region_size = RoundUp(size, allocate_page_size_);
+  if (!region_allocator_.AllocateRegionAt(
+          address, region_size, RegionAllocator::RegionState::kExcluded)) {
+    allocation_status_ = AllocationStatus::kHintedAddressTakenOrNotFound;
+    return false;
   }
 
-  return page_allocator_->SetPermissions(ptr, size,
-                                         PageAllocator::Permission::kNoAccess);
+  const bool success = page_allocator_->SetPermissions(
+      ptr, size, PageAllocator::Permission::kNoAccess);
+  if (success) {
+    allocation_status_ = AllocationStatus::kSuccess;
+  } else {
+    allocation_status_ = AllocationStatus::kFailedToCommit;
+  }
+  return success;
 }
 
 bool BoundedPageAllocator::FreePages(void* raw_address, size_t size) {
@@ -132,9 +153,9 @@ bool BoundedPageAllocator::FreePages(void* raw_address, size_t size) {
     // pages here, which will cause any wired pages to be removed by the OS.
     return page_allocator_->DecommitPages(raw_address, size);
   }
-  DCHECK_EQ(page_initialization_mode_,
-            PageInitializationMode::kAllocatedPagesCanBeUninitialized);
   if (page_freeing_mode_ == PageFreeingMode::kMakeInaccessible) {
+    DCHECK_EQ(page_initialization_mode_,
+              PageInitializationMode::kAllocatedPagesCanBeUninitialized);
     return page_allocator_->SetPermissions(raw_address, size,
                                            PageAllocator::kNoAccess);
   }
@@ -178,9 +199,9 @@ bool BoundedPageAllocator::ReleasePages(void* raw_address, size_t size,
     // See comment in FreePages().
     return (page_allocator_->DecommitPages(free_address, free_size));
   }
-  DCHECK_EQ(page_initialization_mode_,
-            PageInitializationMode::kAllocatedPagesCanBeUninitialized);
   if (page_freeing_mode_ == PageFreeingMode::kMakeInaccessible) {
+    DCHECK_EQ(page_initialization_mode_,
+              PageInitializationMode::kAllocatedPagesCanBeUninitialized);
     return page_allocator_->SetPermissions(free_address, free_size,
                                            PageAllocator::kNoAccess);
   }
@@ -193,7 +214,11 @@ bool BoundedPageAllocator::SetPermissions(void* address, size_t size,
   DCHECK(IsAligned(reinterpret_cast<Address>(address), commit_page_size_));
   DCHECK(IsAligned(size, commit_page_size_));
   DCHECK(region_allocator_.contains(reinterpret_cast<Address>(address), size));
-  return page_allocator_->SetPermissions(address, size, access);
+  const bool success = page_allocator_->SetPermissions(address, size, access);
+  if (!success) {
+    allocation_status_ = AllocationStatus::kFailedToCommit;
+  }
+  return success;
 }
 
 bool BoundedPageAllocator::RecommitPages(void* address, size_t size,
@@ -201,7 +226,11 @@ bool BoundedPageAllocator::RecommitPages(void* address, size_t size,
   DCHECK(IsAligned(reinterpret_cast<Address>(address), commit_page_size_));
   DCHECK(IsAligned(size, commit_page_size_));
   DCHECK(region_allocator_.contains(reinterpret_cast<Address>(address), size));
-  return page_allocator_->RecommitPages(address, size, access);
+  const bool success = page_allocator_->RecommitPages(address, size, access);
+  if (!success) {
+    allocation_status_ = AllocationStatus::kFailedToCommit;
+  }
+  return success;
 }
 
 bool BoundedPageAllocator::DiscardSystemPages(void* address, size_t size) {
@@ -210,6 +239,24 @@ bool BoundedPageAllocator::DiscardSystemPages(void* address, size_t size) {
 
 bool BoundedPageAllocator::DecommitPages(void* address, size_t size) {
   return page_allocator_->DecommitPages(address, size);
+}
+
+bool BoundedPageAllocator::SealPages(void* address, size_t size) {
+  return page_allocator_->SealPages(address, size);
+}
+
+const char* BoundedPageAllocator::AllocationStatusToString(
+    AllocationStatus allocation_status) {
+  switch (allocation_status) {
+    case AllocationStatus::kSuccess:
+      return "Success";
+    case AllocationStatus::kFailedToCommit:
+      return "Failed to commit";
+    case AllocationStatus::kRanOutOfReservation:
+      return "Ran out of reservation";
+    case AllocationStatus::kHintedAddressTakenOrNotFound:
+      return "Hinted address was taken or not found";
+  }
 }
 
 }  // namespace base

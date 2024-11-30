@@ -5,8 +5,10 @@
 #ifndef V8_COMPILER_PROPERTY_ACCESS_BUILDER_H_
 #define V8_COMPILER_PROPERTY_ACCESS_BUILDER_H_
 
-#include "src/base/optional.h"
+#include <optional>
+
 #include "src/codegen/machine-type.h"
+#include "src/compiler/feedback-source.h"
 #include "src/compiler/js-heap-broker.h"
 #include "src/compiler/node.h"
 #include "src/handles/handles.h"
@@ -42,7 +44,13 @@ class PropertyAccessBuilder {
                       ZoneVector<MapRef> const& maps);
 
   Node* BuildCheckValue(Node* receiver, Effect* effect, Control control,
-                        Handle<HeapObject> value);
+                        ObjectRef value);
+
+  Node* BuildCheckSmi(Node* value, Effect* effect, Control control,
+                      FeedbackSource feedback_source = FeedbackSource());
+
+  Node* BuildCheckNumber(Node* value, Effect* effect, Control control,
+                         FeedbackSource feedback_source = FeedbackSource());
 
   // Builds the actual load for data-field and data-constant-field
   // properties (without heap-object or map checks).
@@ -53,7 +61,7 @@ class PropertyAccessBuilder {
   // Tries to load a constant value from a prototype object in dictionary mode
   // and constant-folds it. Returns {} if the constant couldn't be safely
   // retrieved.
-  base::Optional<Node*> FoldLoadDictPrototypeConstant(
+  std::optional<Node*> FoldLoadDictPrototypeConstant(
       PropertyAccessInfo const& access_info);
 
   static MachineRepresentation ConvertRepresentation(
@@ -79,7 +87,7 @@ class PropertyAccessBuilder {
                       Node* lookup_start_object);
 
   Node* BuildLoadDataField(NameRef name, Node* holder,
-                           FieldAccess& field_access, bool is_inobject,
+                           FieldAccess&& field_access, bool is_inobject,
                            Node** effect, Node** control);
 
   JSGraph* jsgraph_;
@@ -87,6 +95,8 @@ class PropertyAccessBuilder {
 };
 
 bool HasOnlyStringMaps(JSHeapBroker* broker, ZoneVector<MapRef> const& maps);
+bool HasOnlyStringWrapperMaps(JSHeapBroker* broker,
+                              ZoneVector<MapRef> const& maps);
 
 }  // namespace compiler
 }  // namespace internal

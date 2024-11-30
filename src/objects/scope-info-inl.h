@@ -29,9 +29,13 @@ bool ScopeInfo::HasSimpleParameters() const {
   return HasSimpleParametersBit::decode(Flags());
 }
 
-int ScopeInfo::Flags() const { return flags(); }
+uint32_t ScopeInfo::Flags() const { return flags(kRelaxedLoad); }
 int ScopeInfo::ParameterCount() const { return parameter_count(); }
 int ScopeInfo::ContextLocalCount() const { return context_local_count(); }
+
+Tagged<DependentCode> ScopeInfo::dependent_code() const {
+  return Cast<DependentCode>(TorqueGeneratedScopeInfo::dependent_code());
+}
 
 ObjectSlot ScopeInfo::data_start() { return RawField(OffsetOfElementAt(0)); }
 
@@ -72,7 +76,7 @@ class ScopeInfo::LocalNamesRange {
         return scope_info()->ContextInlinedLocalName(cage_base,
                                                      index_.as_int());
       }
-      return String::cast(table()->KeyAt(cage_base, index_));
+      return Cast<String>(table()->KeyAt(cage_base, index_));
     }
 
     Tagged<String> name() const {

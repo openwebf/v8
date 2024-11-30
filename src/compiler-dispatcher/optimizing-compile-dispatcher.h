@@ -23,6 +23,62 @@ class TurbofanCompilationJob;
 class RuntimeCallStats;
 class SharedFunctionInfo;
 
+// Circular queue of incoming recompilation tasks (including OSR).
+class V8_EXPORT OptimizingCompileDispatcherQueue {
+ public:
+  inline bool IsAvailable() {
+    base::MutexGuard access(&mutex_);
+    return length_ < capacity_;
+  }
+
+  inline int Length() {
+    base::MutexGuard access_queue(&mutex_);
+    return length_;
+  }
+
+  explicit OptimizingCompileDispatcherQueue(int capacity)
+      : capacity_(capacity), length_(0), shift_(0) {
+    queue_ = NewArray<TurbofanCompilationJob*>(capacity_);
+  }
+
+  ~OptimizingCompileDispatcherQueue() { DeleteArray(queue_); }
+
+  TurbofanCompilationJob* Dequeue() {
+    base::MutexGuard access(&mutex_);
+    if (length_ == 0) return nullptr;
+    TurbofanCompilationJob* job = queue_[QueueIndex(0)];
+    DCHECK_NOT_NULL(job);
+    shift_ = QueueIndex(1);
+    length_--;
+    return job;
+  }
+
+  void Enqueue(TurbofanCompilationJob* job) {
+    base::MutexGuard access(&mutex_);
+    DCHECK_LT(length_, capacity_);
+    queue_[QueueIndex(length_)] = job;
+    length_++;
+  }
+
+  void Flush(Isolate* isolate);
+
+  void Prioritize(Tagged<SharedFunctionInfo> function);
+
+ private:
+  inline int QueueIndex(int i) {
+    int result = (i + shift_) % capacity_;
+    DCHECK_LE(0, result);
+    DCHECK_LT(result, capacity_);
+    return result;
+  }
+
+  TurbofanCompilationJob** queue_;
+  int capacity_;
+  int length_;
+  int shift_;
+  base::Mutex mutex_;
+};
+
 class V8_EXPORT_PRIVATE OptimizingCompileDispatcher {
  public:
   explicit OptimizingCompileDispatcher(Isolate* isolate);
@@ -36,15 +92,16 @@ class V8_EXPORT_PRIVATE OptimizingCompileDispatcher {
   void AwaitCompileTasks();
   void InstallOptimizedFunctions();
 
-  inline bool IsQueueAvailable() {
-    base::MutexGuard access_input_queue(&input_queue_mutex_);
-    return input_queue_length_ < input_queue_capacity_;
-  }
+  // Install generated builtins in the output queue in contiguous finalization
+  // order, starting with installed_count. Returns true if any builtins were
+  // installed or if the output queue is empty, and false otherwise.
+  V8_WARN_UNUSED_RESULT bool InstallGeneratedBuiltins(int& installed_count);
 
-  inline int InputQueueLength() {
-    base::MutexGuard access_input_queue(&input_queue_mutex_);
-    return input_queue_length_;
-  }
+  // Returns the sum of allocation sizes of all jobs waiting to be finalized in
+  // the output queue. Takes the output_queue_mutex_.
+  size_t ComputeOutputQueueTotalZoneSize();
+
+  inline bool IsQueueAvailable() { return input_queue_.IsAvailable(); }
 
   static bool Enabled() { return v8_flags.concurrent_recompilation; }
 
@@ -53,44 +110,37 @@ class V8_EXPORT_PRIVATE OptimizingCompileDispatcher {
 
   // Whether to finalize and thus install the optimized code.  Defaults to true.
   // Only set to false for testing (where finalization is then manually
-  // requested using %FinalizeOptimization).
+  // requested using %FinalizeOptimization) and when compiling embedded builtins
+  // concurrently. For the latter, builtins are installed manually using
+  // InstallGeneratedBuiltins().
   bool finalize() const { return finalize_; }
   void set_finalize(bool finalize) {
     CHECK(!HasJobs());
     finalize_ = finalize;
   }
 
+  void Prioritize(Tagged<SharedFunctionInfo> function);
+
  private:
   class CompileTask;
 
   enum ModeFlag { COMPILE, FLUSH };
   static constexpr TaskPriority kTaskPriority = TaskPriority::kUserVisible;
+  static constexpr TaskPriority kEfficiencyTaskPriority =
+      TaskPriority::kBestEffort;
 
-  void FlushQueues(BlockingBehavior blocking_behavior,
-                   bool restore_function_code);
+  void FlushQueues(BlockingBehavior blocking_behavior);
   void FlushInputQueue();
-  void FlushOutputQueue(bool restore_function_code);
+  void FlushOutputQueue();
   void CompileNext(TurbofanCompilationJob* job, LocalIsolate* local_isolate);
   TurbofanCompilationJob* NextInput(LocalIsolate* local_isolate);
 
-  inline int InputQueueIndex(int i) {
-    int result = (i + input_queue_shift_) % input_queue_capacity_;
-    DCHECK_LE(0, result);
-    DCHECK_LT(result, input_queue_capacity_);
-    return result;
-  }
-
   Isolate* isolate_;
 
-  // Circular queue of incoming recompilation tasks (including OSR).
-  TurbofanCompilationJob** input_queue_;
-  int input_queue_capacity_;
-  int input_queue_length_;
-  int input_queue_shift_;
-  base::Mutex input_queue_mutex_;
+  OptimizingCompileDispatcherQueue input_queue_;
 
   // Queue of recompilation tasks ready to be installed (excluding OSR).
-  std::queue<TurbofanCompilationJob*> output_queue_;
+  std::deque<TurbofanCompilationJob*> output_queue_;
   // Used for job based recompilation which has multiple producers on
   // different threads.
   base::Mutex output_queue_mutex_;

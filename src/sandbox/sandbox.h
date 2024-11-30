@@ -8,6 +8,7 @@
 #include "include/v8-internal.h"
 #include "include/v8-platform.h"
 #include "include/v8config.h"
+#include "src/base/bounds.h"
 #include "src/common/globals.h"
 #include "testing/gtest/include/gtest/gtest_prod.h"  // nogncheck
 
@@ -58,6 +59,13 @@ class V8_EXPORT_PRIVATE Sandbox {
   Sandbox(const Sandbox&) = delete;
   Sandbox& operator=(Sandbox&) = delete;
 
+  /*
+   * Currently, if not enough virtual memory can be reserved for the sandbox,
+   * we will fall back to a partially-reserved sandbox. This constant can be
+   * used to determine if this fall-back is enabled.
+   * */
+  static constexpr bool kFallbackToPartiallyReservedSandboxAllowed = true;
+
   /**
    * Initializes this sandbox.
    *
@@ -95,6 +103,18 @@ class V8_EXPORT_PRIVATE Sandbox {
    * up inside the sandbox, which affects its security properties.
    */
   bool is_partially_reserved() const { return reservation_size_ < size_; }
+
+  /**
+   * Returns true if the first four GB of the address space are inaccessible.
+   *
+   * During initialization, the sandbox will also attempt to create an
+   * inaccessible mapping in the first four GB of the address space. This is
+   * useful to mitigate Smi<->HeapObject confusion issues, in which a (32-bit)
+   * Smi is treated as a pointer and dereferenced.
+   */
+  bool smi_address_range_is_inaccessible() const {
+    return first_four_gb_of_address_space_are_reserved_;
+  }
 
   /**
    * The base address of the sandbox.
@@ -146,7 +166,7 @@ class V8_EXPORT_PRIVATE Sandbox {
    * Returns true if the given address lies within the sandbox address space.
    */
   bool Contains(Address addr) const {
-    return addr >= base_ && addr < base_ + size_;
+    return base::IsInHalfOpenRange(addr, base_, base_ + size_);
   }
 
   /**
@@ -154,6 +174,24 @@ class V8_EXPORT_PRIVATE Sandbox {
    */
   bool Contains(void* ptr) const {
     return Contains(reinterpret_cast<Address>(ptr));
+  }
+
+  /**
+   * Returns true if the given address lies within the sandbox reservation.
+   *
+   * This is a variant of Contains that checks whether the address lies within
+   * the virtual address space reserved for the sandbox. In the case of a
+   * fully-reserved sandbox (the default) this is essentially the same as
+   * Contains but also includes the guard region. In the case of a
+   * partially-reserved sandbox, this will only test against the address region
+   * that was actually reserved.
+   * This can be useful when checking that objects are *not* located within the
+   * sandbox, as in the case of a partially-reserved sandbox, they may still
+   * end up in the unreserved part.
+   */
+  bool ReservationContains(Address addr) const {
+    return base::IsInHalfOpenRange(addr, reservation_base_,
+                                   reservation_base_ + reservation_size_);
   }
 
   class SandboxedPointerConstants final {
@@ -186,8 +224,7 @@ class V8_EXPORT_PRIVATE Sandbox {
 
   // These tests call the private Initialize methods below.
   FRIEND_TEST(SandboxTest, InitializationWithSize);
-  FRIEND_TEST(SandboxTest, PartiallyReservedSandboxInitialization);
-  FRIEND_TEST(SandboxTest, PartiallyReservedSandboxPageAllocation);
+  FRIEND_TEST(SandboxTest, PartiallyReservedSandbox);
 
   // We allow tests to disable the guard regions around the sandbox. This is
   // useful for example for tests like the SequentialUnmapperTest which track
@@ -234,11 +271,31 @@ class V8_EXPORT_PRIVATE Sandbox {
 
   // Constant objects inside this sandbox.
   SandboxedPointerConstants constants_;
+
+  // Besides the address space reservation for the sandbox, we also try to
+  // reserve the first four gigabytes of the virtual address space (with an
+  // inaccessible mapping). This for example mitigates Smi<->HeapObject
+  // confusion bugs in which we treat a Smi value as a pointer and access it.
+  static bool first_four_gb_of_address_space_are_reserved_;
 };
 
 V8_EXPORT_PRIVATE Sandbox* GetProcessWideSandbox();
 
 #endif  // V8_ENABLE_SANDBOX
+
+// Helper function that can be used to ensure that certain objects are not
+// located inside the sandbox. Typically used for trusted objects.
+// Will always return false when the sandbox is disabled or partially reserved.
+V8_INLINE bool InsideSandbox(uintptr_t address) {
+#ifdef V8_ENABLE_SANDBOX
+  Sandbox* sandbox = GetProcessWideSandbox();
+  // Use ReservationContains (instead of just Contains) to correctly handle the
+  // case of partially-reserved sandboxes.
+  return sandbox->ReservationContains(address);
+#else
+  return false;
+#endif
+}
 
 V8_INLINE void* EmptyBackingStoreBuffer() {
 #ifdef V8_ENABLE_SANDBOX

@@ -6,6 +6,7 @@
 #define V8_COMPILER_COMPILATION_DEPENDENCIES_H_
 
 #include "src/compiler/js-heap-broker.h"
+#include "src/objects/property-cell.h"
 #include "src/zone/zone-containers.h"
 
 namespace v8 {
@@ -27,7 +28,7 @@ class SlackTrackingPrediction {
 class CompilationDependency;
 
 // Collects and installs dependencies of the code that is being generated.
-class V8_EXPORT_PRIVATE CompilationDependencies : public ZoneObject {
+class V8_EXPORT CompilationDependencies : public ZoneObject {
  public:
   CompilationDependencies(JSHeapBroker* broker, Zone* zone);
 
@@ -82,6 +83,15 @@ class V8_EXPORT_PRIVATE CompilationDependencies : public ZoneObject {
   // {IsReadOnly()} flag of {cell}'s {PropertyDetails}.
   void DependOnGlobalProperty(PropertyCellRef cell);
 
+  // Record a property assumption in the script context slot.
+  bool DependOnScriptContextSlotProperty(
+      ContextRef script_context, size_t index,
+      ContextSidePropertyCell::Property property, JSHeapBroker* broker);
+
+  // Record the assumption that respective contexts do not have context
+  // extension, if true.
+  bool DependOnEmptyContextExtension(ScopeInfoRef scope_info);
+
   // Return the validity of the given protector and, if true, record the
   // assumption that the protector remains valid.
   bool DependOnProtector(PropertyCellRef cell);
@@ -96,6 +106,8 @@ class V8_EXPORT_PRIVATE CompilationDependencies : public ZoneObject {
   bool DependOnPromiseThenProtector();
   bool DependOnMegaDOMProtector();
   bool DependOnNoProfilingProtector();
+  bool DependOnNoUndetectableObjectsProtector();
+  bool DependOnStringWrapperToPrimitiveProtector();
 
   // Record the assumption that {site}'s {ElementsKind} doesn't change.
   void DependOnElementsKind(AllocationSiteRef site);
@@ -110,8 +122,9 @@ class V8_EXPORT_PRIVATE CompilationDependencies : public ZoneObject {
   // Record the assumption that the {value} read from {holder} at {index} on the
   // background thread is the correct value for a given property.
   void DependOnOwnConstantDataProperty(JSObjectRef holder, MapRef map,
-                                       Representation representation,
                                        FieldIndex index, ObjectRef value);
+  void DependOnOwnConstantDoubleProperty(JSObjectRef holder, MapRef map,
+                                         FieldIndex index, Float64 value);
 
   // Record the assumption that the {value} read from {holder} at {index} on the
   // background thread is the correct value for a given dictionary property.

@@ -8,10 +8,10 @@
 #include "src/compiler/backend/instruction-selector.h"
 #include "src/compiler/common-operator.h"
 #include "src/compiler/compiler-source-position-table.h"
-#include "src/compiler/graph-visualizer.h"
 #include "src/compiler/machine-operator.h"
 #include "src/compiler/node-origin-table.h"
 #include "src/compiler/pipeline.h"
+#include "src/compiler/turbofan-graph-visualizer.h"
 // TODO(14108): Remove.
 #include "src/compiler/wasm-compiler.h"
 #include "src/wasm/wasm-engine.h"
@@ -20,7 +20,9 @@ namespace v8::internal::compiler::turboshaft {
 
 wasm::WasmCompilationResult ExecuteTurboshaftWasmCompilation(
     wasm::CompilationEnv* env, compiler::WasmCompilationData& data,
-    wasm::WasmFeatures* detected) {
+    wasm::WasmDetectedFeatures* detected) {
+  // TODO(nicohartmann): We should not allocate TurboFan graph(s) here but
+  // instead use only Turboshaft inside `GenerateWasmCodeFromTurboshaftGraph`.
   Zone zone(wasm::GetWasmEngine()->allocator(), ZONE_NAME, kCompressGraphZone);
   compiler::MachineGraph* mcgraph = zone.New<compiler::MachineGraph>(
       zone.New<compiler::Graph>(&zone), zone.New<CommonOperatorBuilder>(&zone),
@@ -48,9 +50,8 @@ wasm::WasmCompilationResult ExecuteTurboshaftWasmCompilation(
   data.assumptions = new wasm::AssumptionsJournal();
   auto call_descriptor = GetWasmCallDescriptor(&zone, data.func_body.sig);
 
-  if (!Pipeline::GenerateWasmCodeFromTurboshaftGraph(&info, env, data, mcgraph,
-                                                     data.func_body, detected,
-                                                     call_descriptor)) {
+  if (!Pipeline::GenerateWasmCodeFromTurboshaftGraph(
+          &info, env, data, mcgraph, detected, call_descriptor)) {
     delete data.assumptions;
     return {};
   }

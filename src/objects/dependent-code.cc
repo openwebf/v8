@@ -4,6 +4,7 @@
 
 #include "src/objects/dependent-code.h"
 
+#include "src/base/bits.h"
 #include "src/deoptimizer/deoptimizer.h"
 #include "src/objects/allocation-site-inl.h"
 #include "src/objects/dependent-code-inl.h"
@@ -15,23 +16,31 @@ namespace internal {
 Tagged<DependentCode> DependentCode::GetDependentCode(
     Tagged<HeapObject> object) {
   if (IsMap(object)) {
-    return Map::cast(object)->dependent_code();
+    return Cast<Map>(object)->dependent_code();
   } else if (IsPropertyCell(object)) {
-    return PropertyCell::cast(object)->dependent_code();
+    return Cast<PropertyCell>(object)->dependent_code();
   } else if (IsAllocationSite(object)) {
-    return AllocationSite::cast(object)->dependent_code();
+    return Cast<AllocationSite>(object)->dependent_code();
+  } else if (IsContextSidePropertyCell(object)) {
+    return Cast<ContextSidePropertyCell>(object)->dependent_code();
+  } else if (IsScopeInfo(object)) {
+    return Cast<ScopeInfo>(object)->dependent_code();
   }
   UNREACHABLE();
 }
 
 void DependentCode::SetDependentCode(Handle<HeapObject> object,
-                                     Handle<DependentCode> dep) {
+                                     DirectHandle<DependentCode> dep) {
   if (IsMap(*object)) {
-    Handle<Map>::cast(object)->set_dependent_code(*dep);
+    Cast<Map>(object)->set_dependent_code(*dep);
   } else if (IsPropertyCell(*object)) {
-    Handle<PropertyCell>::cast(object)->set_dependent_code(*dep);
+    Cast<PropertyCell>(object)->set_dependent_code(*dep);
   } else if (IsAllocationSite(*object)) {
-    Handle<AllocationSite>::cast(object)->set_dependent_code(*dep);
+    Cast<AllocationSite>(object)->set_dependent_code(*dep);
+  } else if (IsContextSidePropertyCell(*object)) {
+    Cast<ContextSidePropertyCell>(object)->set_dependent_code(*dep);
+  } else if (IsScopeInfo(*object)) {
+    Cast<ScopeInfo>(object)->set_dependent_code(*dep);
   } else {
     UNREACHABLE();
   }
@@ -73,20 +82,24 @@ void DependentCode::InstallDependency(Isolate* isolate, Handle<Code> code,
 
 Handle<DependentCode> DependentCode::InsertWeakCode(
     Isolate* isolate, Handle<DependentCode> entries, DependencyGroups groups,
-    Handle<Code> code) {
+    DirectHandle<Code> code) {
   if (entries->length() == entries->capacity()) {
     // We'd have to grow - try to compact first.
     entries->IterateAndCompact(
-        [](Tagged<Code>, DependencyGroups) { return false; });
+        isolate, [](Tagged<Code>, DependencyGroups) { return false; });
   }
 
-  MaybeObjectHandle code_slot(HeapObjectReference::Weak(*code), isolate);
-  entries = Handle<DependentCode>::cast(WeakArrayList::AddToEnd(
+  // As the Code object lives outside of the sandbox in trusted space, we need
+  // to use its in-sandbox wrapper object here.
+  MaybeObjectDirectHandle code_slot(MakeWeak(code->wrapper()), isolate);
+  entries = Cast<DependentCode>(WeakArrayList::AddToEnd(
       isolate, entries, code_slot, Smi::FromInt(groups)));
   return entries;
 }
 
-void DependentCode::IterateAndCompact(const IterateAndCompactFn& fn) {
+template <typename Function>
+void DependentCode::IterateAndCompact(IsolateForSandbox isolate,
+                                      const Function& fn) {
   DisallowGarbageCollection no_gc;
 
   int len = length();
@@ -99,14 +112,14 @@ void DependentCode::IterateAndCompact(const IterateAndCompactFn& fn) {
   // - Any cleared slots are filled from the back of the list.
   int i = len - kSlotsPerEntry;
   while (i >= 0) {
-    MaybeObject obj = Get(i + kCodeSlotOffset);
-    if (obj->IsCleared()) {
+    Tagged<MaybeObject> obj = Get(i + kCodeSlotOffset);
+    if (obj.IsCleared()) {
       len = FillEntryFromBack(i, len);
       i -= kSlotsPerEntry;
       continue;
     }
 
-    if (fn(Code::cast(obj.GetHeapObjectAssumeWeak()),
+    if (fn(Cast<CodeWrapper>(obj.GetHeapObjectAssumeWeak())->code(isolate),
            static_cast<DependencyGroups>(
                Get(i + kGroupsSlotOffset).ToSmi().value()))) {
       len = FillEntryFromBack(i, len);
@@ -123,11 +136,17 @@ bool DependentCode::MarkCodeForDeoptimization(
   DisallowGarbageCollection no_gc;
 
   bool marked_something = false;
-  IterateAndCompact([&](Tagged<Code> code, DependencyGroups groups) {
+  IterateAndCompact(isolate, [&](Tagged<Code> code, DependencyGroups groups) {
     if ((groups & deopt_groups) == 0) return false;
 
     if (!code->marked_for_deoptimization()) {
-      code->SetMarkedForDeoptimization(isolate, "code dependencies");
+      // Pick a single group out of the applicable deopt groups, to use as the
+      // deopt reason. Only one group is reported to avoid string concatenation.
+      DependencyGroup first_group = static_cast<DependencyGroup>(
+          1 << base::bits::CountTrailingZeros32(groups & deopt_groups));
+      const char* reason = DependentCode::DependencyGroupName(first_group);
+
+      code->SetMarkedForDeoptimization(isolate, reason);
       marked_something = true;
     }
 
@@ -141,8 +160,8 @@ int DependentCode::FillEntryFromBack(int index, int length) {
   DCHECK_EQ(index % 2, 0);
   DCHECK_EQ(length % 2, 0);
   for (int i = length - kSlotsPerEntry; i > index; i -= kSlotsPerEntry) {
-    MaybeObject obj = Get(i + kCodeSlotOffset);
-    if (obj->IsCleared()) continue;
+    Tagged<MaybeObject> obj = Get(i + kCodeSlotOffset);
+    if (obj.IsCleared()) continue;
 
     Set(index + kCodeSlotOffset, obj);
     Set(index + kGroupsSlotOffset, Get(i + kGroupsSlotOffset),
@@ -165,7 +184,7 @@ void DependentCode::DeoptimizeDependencyGroups(
 // static
 Tagged<DependentCode> DependentCode::empty_dependent_code(
     const ReadOnlyRoots& roots) {
-  return DependentCode::cast(roots.empty_weak_array_list());
+  return Cast<DependentCode>(roots.empty_weak_array_list());
 }
 
 const char* DependentCode::DependencyGroupName(DependencyGroup group) {
@@ -188,6 +207,10 @@ const char* DependentCode::DependencyGroupName(DependencyGroup group) {
       return "allocation-site-tenuring-changed";
     case kAllocationSiteTransitionChangedGroup:
       return "allocation-site-transition-changed";
+    case kScriptContextSlotPropertyChangedGroup:
+      return "script-context-slot-property-changed";
+    case kEmptyContextExtensionGroup:
+      return "empty-context-extension";
   }
   UNREACHABLE();
 }

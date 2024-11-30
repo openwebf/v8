@@ -38,8 +38,6 @@ class V8_EXPORT_PRIVATE NamesProvider {
                 base::Vector<const uint8_t> wire_bytes);
   ~NamesProvider();
 
-  // Returns {false} if {devtools_behavior} == false and no name for
-  // {function_index} was present in the name section.
   void PrintFunctionName(StringBuilder& out, uint32_t function_index,
                          FunctionNamesBehavior behavior = kWasmInternal,
                          IndexAsComment index_as_comment = kDontPrintIndex);
@@ -50,6 +48,10 @@ class V8_EXPORT_PRIVATE NamesProvider {
                       uint32_t label_index, uint32_t fallback_index);
   void PrintTypeName(StringBuilder& out, uint32_t type_index,
                      IndexAsComment index_as_comment = kDontPrintIndex);
+  void PrintTypeName(StringBuilder& out, ModuleTypeIndex type_index,
+                     IndexAsComment index_as_comment = kDontPrintIndex) {
+    PrintTypeName(out, type_index.index, index_as_comment);
+  }
   void PrintTableName(StringBuilder& out, uint32_t table_index,
                       IndexAsComment index_as_comment = kDontPrintIndex);
   void PrintMemoryName(StringBuilder& out, uint32_t memory_index,
@@ -84,7 +86,7 @@ class V8_EXPORT_PRIVATE NamesProvider {
 
   // Lazy loading must guard against concurrent modifications from multiple
   // {WasmModuleObject}s.
-  base::Mutex mutex_;
+  mutable base::Mutex mutex_;
   bool has_decoded_{false};
   bool has_computed_function_import_names_{false};
   bool has_computed_import_names_{false};

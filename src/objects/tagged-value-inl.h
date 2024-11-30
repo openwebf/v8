@@ -21,7 +21,7 @@ namespace internal {
 inline StrongTaggedValue::StrongTaggedValue(Tagged<Object> o)
     :
 #ifdef V8_COMPRESS_POINTERS
-      TaggedImpl(CompressionScheme::CompressObject(o.ptr()))
+      TaggedImpl(V8HeapCompressionScheme::CompressObject(o.ptr()))
 #else
       TaggedImpl(o.ptr())
 #endif
@@ -32,28 +32,29 @@ Tagged<Object> StrongTaggedValue::ToObject(Isolate* isolate,
                                            StrongTaggedValue object) {
 #ifdef V8_COMPRESS_POINTERS
   return Tagged<Object>(
-      CompressionScheme::DecompressTagged(isolate, object.ptr()));
+      V8HeapCompressionScheme::DecompressTagged(isolate, object.ptr()));
 #else
   return Tagged<Object>(object.ptr());
 #endif
 }
 
-inline TaggedValue::TaggedValue(MaybeObject o)
+inline TaggedValue::TaggedValue(Tagged<MaybeObject> o)
     :
 #ifdef V8_COMPRESS_POINTERS
-      TaggedImpl(CompressionScheme::CompressAny(o.ptr()))
+      TaggedImpl(V8HeapCompressionScheme::CompressAny(o.ptr()))
 #else
       TaggedImpl(o.ptr())
 #endif
 {
 }
 
-MaybeObject TaggedValue::ToMaybeObject(Isolate* isolate, TaggedValue object) {
+Tagged<MaybeObject> TaggedValue::ToMaybeObject(Isolate* isolate,
+                                               TaggedValue object) {
 #ifdef V8_COMPRESS_POINTERS
-  return MaybeObject(
-      CompressionScheme::DecompressTagged(isolate, object.ptr()));
+  return Tagged<MaybeObject>(
+      V8HeapCompressionScheme::DecompressTagged(isolate, object.ptr()));
 #else
-  return MaybeObject(object.ptr());
+  return Tagged<MaybeObject>(object.ptr());
 #endif
 }
 

@@ -4,10 +4,13 @@
 
 #include "src/inspector/v8-debugger.h"
 
+#include <algorithm>
+
 #include "include/v8-container.h"
 #include "include/v8-context.h"
 #include "include/v8-function.h"
 #include "include/v8-microtask-queue.h"
+#include "include/v8-profiler.h"
 #include "include/v8-util.h"
 #include "src/inspector/inspected-context.h"
 #include "src/inspector/protocol/Protocol.h"
@@ -19,12 +22,14 @@
 #include "src/inspector/v8-runtime-agent-impl.h"
 #include "src/inspector/v8-stack-trace-impl.h"
 #include "src/inspector/v8-value-utils.h"
+#include "src/tracing/trace-event.h"
 
 namespace v8_inspector {
 
 namespace {
 
 static const size_t kMaxAsyncTaskStacks = 8 * 1024;
+static const size_t kMaxExternalParents = 1 * 1024;
 static const int kNoBreakpointId = 0;
 
 template <typename Map>
@@ -38,7 +43,11 @@ void cleanupExpiredWeakPointers(Map& map) {
   }
 }
 
-class MatchPrototypePredicate : public v8::debug::QueryObjectPredicate {
+// Allow usages of v8::Object::GetPrototype() for now.
+// TODO(https://crbug.com/333672197): remove.
+START_ALLOW_USE_DEPRECATED()
+
+class MatchPrototypePredicate : public v8::QueryObjectPredicate {
  public:
   MatchPrototypePredicate(V8InspectorImpl* inspector,
                           v8::Local<v8::Context> context,
@@ -67,6 +76,10 @@ class MatchPrototypePredicate : public v8::debug::QueryObjectPredicate {
   v8::Local<v8::Context> m_context;
   v8::Local<v8::Value> m_prototype;
 };
+
+// Allow usages of v8::Object::GetPrototype() for now.
+// TODO(https://crbug.com/333672197): remove.
+END_ALLOW_USE_DEPRECATED()
 
 }  // namespace
 
@@ -766,10 +779,12 @@ void V8Debugger::AsyncEventOccurred(v8::debug::DebugAsyncActionType type,
       asyncTaskFinishedForStack(task);
       asyncTaskFinishedForStepping(task);
       break;
-    case v8::debug::kDebugAwait: {
+    case v8::debug::kDebugAwait:
       asyncTaskScheduledForStack(toStringView("await"), task, false, true);
       break;
-    }
+    case v8::debug::kDebugStackTraceCaptured:
+      asyncStackTraceCaptured(id);
+      break;
   }
 }
 
@@ -802,7 +817,7 @@ v8::MaybeLocal<v8::Value> V8Debugger::getTargetScopes(
   }
   if (!iterator) return v8::MaybeLocal<v8::Value>();
   v8::Local<v8::Array> result = v8::Array::New(m_isolate);
-  if (!result->SetPrototype(context, v8::Null(m_isolate)).FromMaybe(false)) {
+  if (!result->SetPrototypeV2(context, v8::Null(m_isolate)).FromMaybe(false)) {
     return v8::MaybeLocal<v8::Value>();
   }
 
@@ -882,7 +897,7 @@ v8::MaybeLocal<v8::Array> V8Debugger::collectionsEntries(
 
   v8::Local<v8::Array> wrappedEntries = v8::Array::New(isolate);
   CHECK(!isKeyValue || wrappedEntries->Length() % 2 == 0);
-  if (!wrappedEntries->SetPrototype(context, v8::Null(isolate))
+  if (!wrappedEntries->SetPrototypeV2(context, v8::Null(isolate))
            .FromMaybe(false))
     return v8::MaybeLocal<v8::Array>();
   for (uint32_t i = 0; i < entries->Length(); i += isKeyValue ? 2 : 1) {
@@ -891,7 +906,7 @@ v8::MaybeLocal<v8::Array> V8Debugger::collectionsEntries(
     v8::Local<v8::Value> value;
     if (isKeyValue && !entries->Get(context, i + 1).ToLocal(&value)) continue;
     v8::Local<v8::Object> wrapper = v8::Object::New(isolate);
-    if (!wrapper->SetPrototype(context, v8::Null(isolate)).FromMaybe(false))
+    if (!wrapper->SetPrototypeV2(context, v8::Null(isolate)).FromMaybe(false))
       continue;
     createDataProperty(
         context, wrapper,
@@ -914,25 +929,25 @@ v8::MaybeLocal<v8::Array> V8Debugger::privateMethods(
     return v8::MaybeLocal<v8::Array>();
   }
   v8::Isolate* isolate = context->GetIsolate();
-  std::vector<v8::Local<v8::Value>> names;
-  std::vector<v8::Local<v8::Value>> values;
+  v8::LocalVector<v8::Value> names(isolate);
+  v8::LocalVector<v8::Value> values(isolate);
   int filter =
       static_cast<int>(v8::debug::PrivateMemberFilter::kPrivateMethods);
   if (!v8::debug::GetPrivateMembers(context, receiver.As<v8::Object>(), filter,
                                     &names, &values) ||
-      names.size() == 0) {
+      names.empty()) {
     return v8::MaybeLocal<v8::Array>();
   }
 
   v8::Local<v8::Array> result = v8::Array::New(isolate);
-  if (!result->SetPrototype(context, v8::Null(isolate)).FromMaybe(false))
+  if (!result->SetPrototypeV2(context, v8::Null(isolate)).FromMaybe(false))
     return v8::MaybeLocal<v8::Array>();
   for (uint32_t i = 0; i < names.size(); i++) {
     v8::Local<v8::Value> name = names[i];
     v8::Local<v8::Value> value = values[i];
     DCHECK(value->IsFunction());
     v8::Local<v8::Object> wrapper = v8::Object::New(isolate);
-    if (!wrapper->SetPrototype(context, v8::Null(isolate)).FromMaybe(false))
+    if (!wrapper->SetPrototypeV2(context, v8::Null(isolate)).FromMaybe(false))
       continue;
     createDataProperty(context, wrapper,
                        toV8StringInternalized(isolate, "name"), name);
@@ -994,7 +1009,7 @@ v8::Local<v8::Array> V8Debugger::queryObjects(v8::Local<v8::Context> context,
   v8::Isolate* isolate = context->GetIsolate();
   std::vector<v8::Global<v8::Object>> v8_objects;
   MatchPrototypePredicate predicate(m_inspector, context, prototype);
-  v8::debug::QueryObjects(context, &predicate, &v8_objects);
+  isolate->GetHeapProfiler()->QueryObjects(context, &predicate, &v8_objects);
 
   v8::MicrotasksScope microtasksScope(context,
                                       v8::MicrotasksScope::kDoNotRunMicrotasks);
@@ -1071,6 +1086,27 @@ void V8Debugger::setMaxCallStackSizeToCapture(V8RuntimeAgentImpl* agent,
     m_isolate->SetCaptureStackTraceForUncaughtExceptions(
         m_maxCallStackSizeToCapture > 0, m_maxCallStackSizeToCapture);
   }
+}
+
+void V8Debugger::asyncParentFor(int stackTraceId,
+                                std::shared_ptr<AsyncStackTrace>* asyncParent,
+                                V8StackTraceId* externalParent) const {
+  auto it = m_asyncParents.find(stackTraceId);
+  if (it != m_asyncParents.end()) {
+    *asyncParent = it->second.lock();
+    if (*asyncParent && (*asyncParent)->isEmpty()) {
+      *asyncParent = (*asyncParent)->parent().lock();
+    }
+  } else {
+    auto externalIt = std::find_if(
+        m_externalParents.begin(), m_externalParents.end(),
+        [stackTraceId](const auto& p) { return p.first == stackTraceId; });
+    if (externalIt != m_externalParents.end()) {
+      *externalParent = externalIt->second;
+    }
+  }
+  DCHECK_IMPLIES(!externalParent->IsInvalid(), !*asyncParent);
+  DCHECK_IMPLIES(*asyncParent, externalParent->IsInvalid());
 }
 
 std::shared_ptr<AsyncStackTrace> V8Debugger::stackTraceFor(
@@ -1165,6 +1201,12 @@ void V8Debugger::asyncTaskFinished(void* task) {
 void V8Debugger::asyncTaskScheduledForStack(const StringView& taskName,
                                             void* task, bool recurring,
                                             bool skipTopFrame) {
+#ifdef V8_USE_PERFETTO
+  TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.inspector"),
+              "v8::Debugger::AsyncTaskScheduled", "taskName",
+              TRACE_STR_COPY(toString16(taskName).utf8().c_str()),
+              perfetto::Flow::ProcessScoped(reinterpret_cast<uintptr_t>(task)));
+#endif  // V8_USE_PERFETTO
   if (!m_maxAsyncCallStackDepth) return;
   v8::HandleScope scope(m_isolate);
   std::shared_ptr<AsyncStackTrace> asyncStack =
@@ -1178,12 +1220,22 @@ void V8Debugger::asyncTaskScheduledForStack(const StringView& taskName,
 }
 
 void V8Debugger::asyncTaskCanceledForStack(void* task) {
+#ifdef V8_USE_PERFETTO
+  TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.inspector"),
+              "v8::Debugger::AsyncTaskCanceled",
+              perfetto::Flow::ProcessScoped(reinterpret_cast<uintptr_t>(task)));
+#endif  // V8_USE_PERFETTO
   if (!m_maxAsyncCallStackDepth) return;
   m_asyncTaskStacks.erase(task);
   m_recurringTasks.erase(task);
 }
 
 void V8Debugger::asyncTaskStartedForStack(void* task) {
+#ifdef V8_USE_PERFETTO
+  TRACE_EVENT_BEGIN(
+      TRACE_DISABLED_BY_DEFAULT("v8.inspector"), "v8::Debugger::AsyncTaskRun",
+      perfetto::Flow::ProcessScoped(reinterpret_cast<uintptr_t>(task)));
+#endif  // V8_USE_PERFETTO
   if (!m_maxAsyncCallStackDepth) return;
   // Needs to support following order of events:
   // - asyncTaskScheduled
@@ -1204,9 +1256,13 @@ void V8Debugger::asyncTaskStartedForStack(void* task) {
 }
 
 void V8Debugger::asyncTaskFinishedForStack(void* task) {
+#ifdef V8_USE_PERFETTO
+  TRACE_EVENT_END0(TRACE_DISABLED_BY_DEFAULT("v8.inspector"),
+                   "v8::Debugger::AsyncTaskRun");
+#endif  // V8_USE_PERFETTO
   if (!m_maxAsyncCallStackDepth) return;
   // We could start instrumenting half way and the stack is empty.
-  if (!m_currentTasks.size()) return;
+  if (m_currentTasks.empty()) return;
   DCHECK(m_currentTasks.back() == task);
   m_currentTasks.pop_back();
 
@@ -1250,12 +1306,25 @@ void V8Debugger::asyncTaskCanceledForStepping(void* task) {
   asyncTaskFinishedForStepping(task);
 }
 
+void V8Debugger::asyncStackTraceCaptured(int id) {
+  auto async_stack = currentAsyncParent();
+  if (async_stack) {
+    m_asyncParents.emplace(id, async_stack);
+  }
+  auto externalParent = currentExternalParent();
+  if (!externalParent.IsInvalid()) {
+    m_externalParents.push_back(std::make_pair(id, externalParent));
+  }
+}
+
 void V8Debugger::allAsyncTasksCanceled() {
   m_asyncTaskStacks.clear();
   m_recurringTasks.clear();
   m_currentAsyncParent.clear();
   m_currentExternalParent.clear();
   m_currentTasks.clear();
+  m_currentAsyncParent.clear();
+  m_externalParents.clear();
 
   m_allAsyncStacks.clear();
 }
@@ -1302,12 +1371,19 @@ void V8Debugger::collectOldAsyncStacksIfNeeded() {
   }
   cleanupExpiredWeakPointers(m_asyncTaskStacks);
   cleanupExpiredWeakPointers(m_cachedStackFrames);
+  cleanupExpiredWeakPointers(m_asyncParents);
   cleanupExpiredWeakPointers(m_storedStackTraces);
   for (auto it = m_recurringTasks.begin(); it != m_recurringTasks.end();) {
     if (m_asyncTaskStacks.find(*it) == m_asyncTaskStacks.end()) {
       it = m_recurringTasks.erase(it);
     } else {
       ++it;
+    }
+  }
+  if (m_externalParents.size() > kMaxExternalParents) {
+    size_t halfOfExternalParents = (m_externalParents.size() + 1) / 2;
+    while (m_externalParents.size() > halfOfExternalParents) {
+      m_externalParents.pop_front();
     }
   }
 }

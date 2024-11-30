@@ -22,23 +22,32 @@ proposal_flags = [
     },
     {
         'name': 'tail-call',
-        'flags': ['--experimental-wasm-tail-call']
+        'flags': []
     },
     {
         'name': 'memory64',
-        'flags': ['--experimental-wasm-memory64']
+        # The memory64 repository is rebased on exnref, so also enable that.
+        'flags': ['--experimental-wasm-memory64', '--experimental-wasm-exnref']
     },
     {
         'name': 'extended-const',
-        'flags': ['--experimental-wasm-extended-const']
+        'flags': []
     },
     {
         'name': 'function-references',
-        'flags': ['--experimental-wasm-typed-funcref']
+        'flags': []
     },
     {
         'name': 'gc',
-        'flags': ['--experimental-wasm-gc']
+        'flags': []
+    },
+    {
+        'name': 'jspi',
+        'flags': ['--experimental-wasm-jspi']
+    },
+    {
+        'name': 'exception-handling',
+        'flags': ['--experimental-wasm-exnref']
     },
 ]
 

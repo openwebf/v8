@@ -4,11 +4,13 @@
 
 #include "src/compiler/frame-states.h"
 
-#include "src/base/functional.h"
+#include <optional>
+
+#include "src/base/hashing.h"
 #include "src/codegen/callable.h"
-#include "src/compiler/graph.h"
 #include "src/compiler/js-graph.h"
 #include "src/compiler/node.h"
+#include "src/compiler/turbofan-graph.h"
 #include "src/handles/handles-inl.h"
 #include "src/objects/objects-inl.h"
 
@@ -69,12 +71,15 @@ std::ostream& operator<<(std::ostream& os, FrameStateType type) {
     case FrameStateType::kJSToWasmBuiltinContinuation:
       os << "JS_TO_WASM_BUILTIN_CONTINUATION_FRAME";
       break;
+    case FrameStateType::kLiftoffFunction:
+      os << "LIFTOFF_FRAME";
+      break;
 #endif  // V8_ENABLE_WEBASSEMBLY
     case FrameStateType::kJavaScriptBuiltinContinuation:
-      os << "JAVA_SCRIPT_BUILTIN_CONTINUATION_FRAME";
+      os << "JAVASCRIPT_BUILTIN_CONTINUATION_FRAME";
       break;
     case FrameStateType::kJavaScriptBuiltinContinuationWithCatch:
-      os << "JAVA_SCRIPT_BUILTIN_CONTINUATION_WITH_CATCH_FRAME";
+      os << "JAVASCRIPT_BUILTIN_CONTINUATION_WITH_CATCH_FRAME";
       break;
   }
   return os;
@@ -115,7 +120,7 @@ FrameState CreateBuiltinContinuationFrameStateCommon(
     Node* context, Node** parameters, int parameter_count,
     Node* outer_frame_state,
     Handle<SharedFunctionInfo> shared = Handle<SharedFunctionInfo>(),
-    const wasm::FunctionSig* signature = nullptr) {
+    const wasm::CanonicalSig* signature = nullptr) {
   Graph* const graph = jsgraph->graph();
   CommonOperatorBuilder* const common = jsgraph->common();
 
@@ -129,12 +134,12 @@ FrameState CreateBuiltinContinuationFrameStateCommon(
       signature ? common->CreateJSToWasmFrameStateFunctionInfo(
                       frame_type, parameter_count, 0, shared, signature)
                 : common->CreateFrameStateFunctionInfo(
-                      frame_type, parameter_count, 0, shared);
+                      frame_type, parameter_count, 0, 0, shared, {});
 #else
   DCHECK_NULL(signature);
   const FrameStateFunctionInfo* state_info =
-      common->CreateFrameStateFunctionInfo(frame_type, parameter_count, 0,
-                                           shared);
+      common->CreateFrameStateFunctionInfo(frame_type, parameter_count, 0, 0,
+                                           shared, {});
 #endif  // V8_ENABLE_WEBASSEMBLY
 
   const Operator* op = common->FrameState(
@@ -149,7 +154,7 @@ FrameState CreateBuiltinContinuationFrameStateCommon(
 FrameState CreateStubBuiltinContinuationFrameState(
     JSGraph* jsgraph, Builtin name, Node* context, Node* const* parameters,
     int parameter_count, Node* outer_frame_state,
-    ContinuationFrameStateMode mode, const wasm::FunctionSig* signature) {
+    ContinuationFrameStateMode mode, const wasm::CanonicalSig* signature) {
   Callable callable = Builtins::CallableFor(jsgraph->isolate(), name);
   CallInterfaceDescriptor descriptor = callable.descriptor();
 
@@ -194,8 +199,8 @@ FrameState CreateStubBuiltinContinuationFrameState(
 #if V8_ENABLE_WEBASSEMBLY
 FrameState CreateJSWasmCallBuiltinContinuationFrameState(
     JSGraph* jsgraph, Node* context, Node* outer_frame_state,
-    const wasm::FunctionSig* signature) {
-  base::Optional<wasm::ValueKind> wasm_return_kind =
+    const wasm::CanonicalSig* signature) {
+  std::optional<wasm::ValueKind> wasm_return_kind =
       wasm::WasmReturnTypeFromSignature(signature);
   Node* node_return_type =
       jsgraph->SmiConstant(wasm_return_kind ? wasm_return_kind.value() : -1);
@@ -216,7 +221,7 @@ FrameState CreateJavaScriptBuiltinContinuationFrameState(
   DCHECK_EQ(Builtins::GetStackParameterCount(name),
             stack_parameter_count + DeoptimizerParameterCountFor(mode));
 
-  Node* argc = jsgraph->Constant(Builtins::GetStackParameterCount(name));
+  Node* argc = jsgraph->ConstantNoHole(Builtins::GetStackParameterCount(name));
 
   // Stack parameters first. They must be first because the receiver is expected
   // to be the second value in the translation when creating stack crawls
@@ -231,9 +236,17 @@ FrameState CreateJavaScriptBuiltinContinuationFrameState(
 
   // Register parameters follow stack parameters. The context will be added by
   // instruction selector during FrameState translation.
+  DCHECK_EQ(
+      Builtins::CallInterfaceDescriptorFor(name).GetRegisterParameterCount(),
+      V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE_BOOL ? 4 : 3);
   actual_parameters.push_back(target);      // kJavaScriptCallTargetRegister
   actual_parameters.push_back(new_target);  // kJavaScriptCallNewTargetRegister
   actual_parameters.push_back(argc);        // kJavaScriptCallArgCountRegister
+#ifdef V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE
+  // The dispatch handle isn't used by the continuation builtins.
+  Node* handle = jsgraph->ConstantNoHole(kInvalidDispatchHandle);
+  actual_parameters.push_back(handle);  // kJavaScriptDispatchHandleRegister
+#endif
 
   return CreateBuiltinContinuationFrameStateCommon(
       jsgraph,
@@ -261,9 +274,7 @@ Node* CreateInlinedApiFunctionFrameState(JSGraph* graph,
                                          Node* target, Node* context,
                                          Node* receiver,
                                          Node* outer_frame_state) {
-  if (!v8_flags.experimental_stack_trace_frames) return outer_frame_state;
-  return CreateGenericLazyDeoptContinuationFrameState(
-      graph, shared, target, context, receiver, outer_frame_state);
+  return outer_frame_state;
 }
 
 FrameState CloneFrameState(JSGraph* jsgraph, FrameState frame_state,

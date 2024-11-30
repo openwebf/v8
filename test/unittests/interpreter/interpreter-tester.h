@@ -22,12 +22,14 @@ namespace interpreter {
 
 template <class... A>
 static MaybeHandle<Object> CallInterpreter(Isolate* isolate,
-                                           Handle<JSFunction> function,
-                                           Handle<Object> receiver, A... args) {
+                                           DirectHandle<JSFunction> function,
+                                           DirectHandle<Object> receiver,
+                                           A... args) {
   // Pad the array with an empty handle to ensure that argv size is at least 1.
   // It avoids MSVC error C2466.
-  Handle<Object> argv[] = {args..., Handle<Object>()};
-  return Execution::Call(isolate, function, receiver, sizeof...(args), argv);
+  DirectHandle<Object> arguments[] = {args..., DirectHandle<Object>()};
+  return Execution::Call(isolate, function, receiver,
+                         {arguments, sizeof...(args)});
 }
 
 template <class... A>
@@ -113,9 +115,9 @@ class InterpreterTester {
 
   Local<Message> CheckThrowsReturnMessage();
 
-  static Handle<Object> NewObject(const char* script);
+  static Handle<JSAny> NewObject(const char* script);
 
-  static Handle<String> GetName(Isolate* isolate, const char* name);
+  static DirectHandle<String> GetName(Isolate* isolate, const char* name);
 
   static std::string SourceForBody(const char* body);
 
@@ -150,7 +152,7 @@ class InterpreterTester {
                                  .ToLocalChecked())
 
               .ToLocalChecked());
-      function = Handle<JSFunction>::cast(v8::Utils::OpenHandle(*api_function));
+      function = Cast<JSFunction>(v8::Utils::OpenHandle(*api_function));
       is_compiled_scope = function->shared()->is_compiled_scope(isolate_);
     } else {
       int arg_count = sizeof...(A);
@@ -159,15 +161,15 @@ class InterpreterTester {
         source += i == 0 ? "a" : ", a";
       }
       source += "){})";
-      function = Handle<JSFunction>::cast(v8::Utils::OpenHandle(
+      function = Cast<JSFunction>(v8::Utils::OpenHandle(
           *v8::Local<v8::Function>::Cast(CompileRun(source.c_str()))));
-      function->set_code(*BUILTIN_CODE(isolate_, InterpreterEntryTrampoline));
+      function->UpdateCode(*BUILTIN_CODE(isolate_, InterpreterEntryTrampoline));
       is_compiled_scope = function->shared()->is_compiled_scope(isolate_);
     }
 
     if (!bytecode_.is_null()) {
-      function->shared()->set_function_data(*bytecode_.ToHandleChecked(),
-                                            kReleaseStore);
+      function->shared()->overwrite_bytecode_array(
+          *bytecode_.ToHandleChecked());
       is_compiled_scope = function->shared()->is_compiled_scope(isolate_);
     }
     if (HasFeedbackMetadata()) {

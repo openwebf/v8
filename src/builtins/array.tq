@@ -28,8 +28,8 @@ macro EnsureWriteableFastElements(
   dcheck(IsFastSmiOrTaggedElementsKind(array.map.elements_kind));
 
   const length = Convert<intptr>(Cast<Smi>(array.length) otherwise unreachable);
-  array.elements =
-      ExtractFixedArray(UnsafeCast<FixedArray>(elements), 0, length, length);
+  array.elements = ExtractFixedArray(
+      UnsafeCast<FixedArray>(elements), 0, length, length, TheHole);
   dcheck(array.elements.map != kCOWMap);
 }
 
@@ -41,12 +41,12 @@ macro LoadElementOrUndefined(
 
 macro LoadElementOrUndefined(a: FixedDoubleArray, i: Smi):
     NumberOrUndefined {
-  const f: float64 = a.floats[i].Value() otherwise return Undefined;
+  const f: float64 = a.values[i].Value() otherwise return Undefined;
   return AllocateHeapNumberWithValue(f);
 }
 
 macro StoreArrayHole(elements: FixedDoubleArray, k: Smi): void {
-  elements.floats[k] = kDoubleHole;
+  elements.values[k] = kDoubleHole;
 }
 
 macro StoreArrayHole(elements: FixedArray, k: Smi): void {

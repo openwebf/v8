@@ -446,7 +446,7 @@ void MipsDebugger::Debug() {
           Heap* current_heap = sim_->isolate_->heap();
           if (!skip_obj_print) {
             if (IsSmi(obj) ||
-                IsValidHeapObject(current_heap, HeapObject::cast(obj))) {
+                IsValidHeapObject(current_heap, Cast<HeapObject>(obj))) {
               PrintF(" (");
               if (IsSmi(obj)) {
                 PrintF("smi %d", Smi::ToInt(obj));
@@ -894,12 +894,12 @@ void Simulator::set_fpu_register_hi_word(int fpureg, int32_t value) {
 
 void Simulator::set_fpu_register_float(int fpureg, float value) {
   DCHECK((fpureg >= 0) && (fpureg < kNumFPURegisters));
-  *base::bit_cast<float*>(&FPUregisters_[fpureg * 2]) = value;
+  memcpy(&FPUregisters_[fpureg * 2], &value, sizeof(value));
 }
 
 void Simulator::set_fpu_register_double(int fpureg, double value) {
   DCHECK((fpureg >= 0) && (fpureg < kNumFPURegisters));
-  *base::bit_cast<double*>(&FPUregisters_[fpureg * 2]) = value;
+  memcpy(&FPUregisters_[fpureg * 2], &value, sizeof(value));
 }
 
 // Get the register from the architecture state. This function does handle
@@ -947,13 +947,12 @@ int32_t Simulator::get_fpu_register_hi_word(int fpureg) const {
 
 float Simulator::get_fpu_register_float(int fpureg) const {
   DCHECK((fpureg >= 0) && (fpureg < kNumFPURegisters));
-  return *base::bit_cast<float*>(
-      const_cast<int64_t*>(&FPUregisters_[fpureg * 2]));
+  return base::bit_cast<float>(get_fpu_register_word(fpureg));
 }
 
 double Simulator::get_fpu_register_double(int fpureg) const {
   DCHECK((fpureg >= 0) && (fpureg < kNumFPURegisters));
-  return *base::bit_cast<double*>(&FPUregisters_[fpureg * 2]);
+  return base::bit_cast<double>(FPUregisters_[fpureg * 2]);
 }
 
 template <typename T>
@@ -2183,12 +2182,13 @@ uintptr_t Simulator::StackLimit(uintptr_t c_limit) const {
   return stack_limit_ + kAdditionalStackMargin;
 }
 
-base::Vector<uint8_t> Simulator::GetCurrentStackView() const {
+base::Vector<uint8_t> Simulator::GetCentralStackView() const {
   // We do not add an additional safety margin as above in
   // Simulator::StackLimit, as users of this method are expected to add their
   // own margin.
-  return base::VectorOf(reinterpret_cast<uint8_t*>(stack_limit_),
-                        UsableStackSize());
+  return base::VectorOf(
+      reinterpret_cast<uint8_t*>(stack_) + kStackProtectionSize,
+      UsableStackSize());
 }
 
 // Unsupported instructions use Format to print an error and stop execution.
@@ -6105,7 +6105,7 @@ void Simulator::DecodeTypeMsa3RF() {
     case MADDR_Q:
     case MSUBR_Q:
       get_msa_register(wd_reg(), &wd);
-      V8_FALLTHROUGH;
+      [[fallthrough]];
     case MUL_Q:
     case MULR_Q:
       switch (DecodeMsaDataFormat()) {

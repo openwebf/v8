@@ -5,9 +5,10 @@
 #ifndef V8_CODEGEN_SIGNATURE_H_
 #define V8_CODEGEN_SIGNATURE_H_
 
-#include "src/base/functional.h"
-#include "src/base/iterator.h"
+#include "src/base/hashing.h"
+#include "src/base/vector.h"
 #include "src/codegen/machine-type.h"
+#include "src/sandbox/check.h"
 #include "src/zone/zone.h"
 
 namespace v8 {
@@ -32,12 +33,14 @@ class Signature : public ZoneObject {
   size_t parameter_count() const { return parameter_count_; }
 
   T GetParam(size_t index) const {
-    DCHECK_LT(index, parameter_count_);
+    // If heap memory is corrupted, we may get confused about the number of
+    // parameters during compilation. These SBXCHECKs defend against that.
+    SBXCHECK_LT(index, parameter_count_);
     return reps_[return_count_ + index];
   }
 
   T GetReturn(size_t index = 0) const {
-    DCHECK_LT(index, return_count_);
+    SBXCHECK_LT(index, return_count_);
     return reps_[index];
   }
 
@@ -46,14 +49,12 @@ class Signature : public ZoneObject {
   }
 
   // Iteration support.
-  base::iterator_range<const T*> parameters() const {
-    return {reps_ + return_count_, reps_ + return_count_ + parameter_count_};
+  base::Vector<const T> parameters() const {
+    return {reps_ + return_count_, parameter_count_};
   }
-  base::iterator_range<const T*> returns() const {
-    return {reps_, reps_ + return_count_};
-  }
-  base::iterator_range<const T*> all() const {
-    return {reps_, reps_ + return_count_ + parameter_count_};
+  base::Vector<const T> returns() const { return {reps_, return_count_}; }
+  base::Vector<const T> all() const {
+    return {reps_, return_count_ + parameter_count_};
   }
 
   bool operator==(const Signature& other) const {
@@ -95,6 +96,12 @@ class Signature : public ZoneObject {
       buffer_[rcursor_++] = val;
     }
 
+    void AddReturnAt(size_t index, T val) {
+      DCHECK_LT(index, return_count_);
+      buffer_[index] = val;
+      rcursor_ = std::max(rcursor_, index + 1);
+    }
+
     void AddParam(T val) {
       DCHECK_LT(pcursor_, parameter_count_);
       buffer_[return_count_ + pcursor_++] = val;
@@ -113,19 +120,6 @@ class Signature : public ZoneObject {
       return sig_;
     }
 
-    // TODO(clemensb): Remove {Build()}, replace all callers by {Get()}.
-    Signature<T>* Build() {
-      // {Build} is the old API, and should be replaced by {Get}.
-      // {Build} did previously return a freshly allocated pointer, so make sure
-      // that we do not call it twice by clearing the {sig_} field.
-      DCHECK_NOT_NULL(sig_);
-      DCHECK_EQ(rcursor_, return_count_);
-      DCHECK_EQ(pcursor_, parameter_count_);
-      Signature<T>* sig = sig_;
-      sig_ = nullptr;
-      return sig;
-    }
-
    private:
     size_t rcursor_;
     size_t pcursor_;
@@ -138,7 +132,7 @@ class Signature : public ZoneObject {
     Builder builder(zone, returns.size(), params.size());
     for (T ret : returns) builder.AddReturn(ret);
     for (T param : params) builder.AddParam(param);
-    return builder.Build();
+    return builder.Get();
   }
 
   static constexpr size_t kReturnCountOffset = 0;
@@ -159,9 +153,7 @@ size_t hash_value(const Signature<T>& sig) {
   // Hash over all contained representations, plus the parameter count to
   // differentiate signatures with the same representation array but different
   // parameter/return count.
-  size_t seed = base::hash_value(sig.parameter_count());
-  for (T rep : sig.all()) seed = base::hash_combine(seed, base::hash<T>{}(rep));
-  return seed;
+  return base::Hasher{}.Add(sig.parameter_count()).AddRange(sig.all()).hash();
 }
 
 template <typename T, size_t kNumReturns = 0, size_t kNumParams = 0>

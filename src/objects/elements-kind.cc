@@ -74,12 +74,13 @@ const uint8_t* TypedArrayAndRabGsabTypedArrayElementsKindSizes() {
 }
 
 int GetDefaultHeaderSizeForElementsKind(ElementsKind elements_kind) {
-  static_assert(FixedArray::kHeaderSize == FixedDoubleArray::kHeaderSize);
+  static_assert(OFFSET_OF_DATA_START(FixedArray) ==
+                OFFSET_OF_DATA_START(FixedDoubleArray));
 
   if (IsTypedArrayOrRabGsabTypedArrayElementsKind(elements_kind)) {
     return 0;
   } else {
-    return FixedArray::kHeaderSize - kHeapObjectTag;
+    return OFFSET_OF_DATA_START(FixedArray) - kHeapObjectTag;
   }
 }
 
@@ -134,6 +135,7 @@ const char* ElementsKindToString(ElementsKind kind) {
     case NO_ELEMENTS:
       return "NO_ELEMENTS";
   }
+  UNREACHABLE();
 }
 
 const ElementsKind kFastElementsKindSequence[kFastElementsKindCount] = {

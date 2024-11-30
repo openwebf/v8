@@ -3,8 +3,11 @@
 // found in the LICENSE file.
 
 #include "src/api/api-inl.h"
+#include "src/base/logging.h"
 #include "src/base/strings.h"
+#include "src/common/globals.h"
 #include "src/objects/js-array-buffer-inl.h"
+#include "src/sandbox/sandbox.h"
 #include "test/cctest/heap/heap-utils.h"
 #include "test/cctest/test-api.h"
 #include "test/common/flag-utils.h"
@@ -12,6 +15,7 @@
 using ::v8::Array;
 using ::v8::Context;
 using ::v8::Local;
+using ::v8::Maybe;
 using ::v8::Value;
 
 namespace {
@@ -94,6 +98,42 @@ THREADED_TEST(ArrayBuffer_ApiInternalToExternal) {
   CHECK_EQ(0xDD, result->Int32Value(env.local()).FromJust());
 }
 
+THREADED_TEST(ArrayBuffer_ApiMaybeNew) {
+  LocalContext env;
+  v8::Isolate* isolate = env->GetIsolate();
+  v8::HandleScope handle_scope(isolate);
+
+  // Reasonable-sized ArrayBuffer.
+  v8::MaybeLocal<v8::ArrayBuffer> maybe_ab =
+      v8::ArrayBuffer::MaybeNew(isolate, 1024);
+  CHECK(!maybe_ab.IsEmpty());
+  auto ab = v8::Local<v8::ArrayBuffer>::Cast(maybe_ab.ToLocalChecked());
+  CheckInternalFieldsAreZero(ab);
+  CHECK_EQ(1024, ab->ByteLength());
+  i::heap::InvokeMajorGC(CcTest::heap());
+
+  std::shared_ptr<v8::BackingStore> backing_store = Externalize(ab);
+  CHECK_EQ(1024, backing_store->ByteLength());
+
+  uint8_t* data = static_cast<uint8_t*>(backing_store->Data());
+  CHECK_NOT_NULL(data);
+  CHECK(env->Global()->Set(env.local(), v8_str("ab"), ab).FromJust());
+
+  v8::Local<v8::Value> result = CompileRun("ab.byteLength");
+  CHECK_EQ(1024, result->Int32Value(env.local()).FromJust());
+
+  // Too large ArrayBuffer.
+  size_t unreasonable_size = 1;
+#if V8_TARGET_ARCH_64_BIT
+  unreasonable_size <<= 53;
+#else
+  unreasonable_size <<= 31;
+#endif
+  v8::MaybeLocal<v8::ArrayBuffer> maybe_ab_2 =
+      v8::ArrayBuffer::MaybeNew(isolate, unreasonable_size);
+  CHECK(maybe_ab_2.IsEmpty());
+}
+
 THREADED_TEST(ArrayBuffer_JSInternalToExternal) {
   LocalContext env;
   v8::Isolate* isolate = env->GetIsolate();
@@ -141,7 +181,7 @@ THREADED_TEST(ArrayBuffer_DisableDetach) {
   Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, 100);
   CHECK(ab->IsDetachable());
 
-  i::Handle<i::JSArrayBuffer> buf = v8::Utils::OpenHandle(*ab);
+  i::DirectHandle<i::JSArrayBuffer> buf = v8::Utils::OpenDirectHandle(*ab);
   buf->set_is_detachable(false);
 
   CHECK(!ab->IsDetachable());
@@ -409,7 +449,7 @@ THREADED_TEST(SkipArrayBufferDuringScavenge) {
   // Make sure the pointer looks like a heap object
   Local<v8::Object> tmp = v8::Object::New(isolate);
   uint8_t* store_ptr =
-      reinterpret_cast<uint8_t*>(*reinterpret_cast<uintptr_t*>(*tmp));
+      reinterpret_cast<uint8_t*>(i::ValueHelper::ValueAsAddress(*tmp));
   auto backing_store = v8::ArrayBuffer::NewBackingStore(
       store_ptr, 8, [](void*, size_t, void*) {}, nullptr);
 
@@ -452,8 +492,6 @@ THREADED_TEST(ArrayBuffer_NewBackingStore) {
 }
 
 THREADED_TEST(ArrayBuffer_NewResizableBackingStore) {
-  FLAG_SCOPE(harmony_rab_gsab);
-
   LocalContext env;
   v8::Isolate* isolate = env->GetIsolate();
   v8::HandleScope handle_scope(isolate);
@@ -535,11 +573,11 @@ TEST(ArrayBuffer_NewBackingStore_EmptyDeleter) {
   std::unique_ptr<v8::BackingStore> backing_store =
       v8::ArrayBuffer::NewBackingStore(buffer, size,
                                        v8::BackingStore::EmptyDeleter, nullptr);
-  uint64_t external_memory_before =
-      isolate->AdjustAmountOfExternalAllocatedMemory(0);
+  uint64_t external_memory_before = v8::ExternalMemoryAccounter::
+      GetTotalAmountOfExternalAllocatedMemoryForTesting(isolate);
   v8::ArrayBuffer::New(isolate, std::move(backing_store));
-  uint64_t external_memory_after =
-      isolate->AdjustAmountOfExternalAllocatedMemory(0);
+  uint64_t external_memory_after = v8::ExternalMemoryAccounter::
+      GetTotalAmountOfExternalAllocatedMemoryForTesting(isolate);
   // The ArrayBuffer constructor does not increase the external memory counter.
   // The counter may decrease however if the allocation triggers GC.
   CHECK_GE(external_memory_before, external_memory_after);
@@ -555,11 +593,11 @@ TEST(SharedArrayBuffer_NewBackingStore_EmptyDeleter) {
   std::unique_ptr<v8::BackingStore> backing_store =
       v8::SharedArrayBuffer::NewBackingStore(
           buffer, size, v8::BackingStore::EmptyDeleter, nullptr);
-  uint64_t external_memory_before =
-      isolate->AdjustAmountOfExternalAllocatedMemory(0);
+  uint64_t external_memory_before = v8::ExternalMemoryAccounter::
+      GetTotalAmountOfExternalAllocatedMemoryForTesting(isolate);
   v8::SharedArrayBuffer::New(isolate, std::move(backing_store));
-  uint64_t external_memory_after =
-      isolate->AdjustAmountOfExternalAllocatedMemory(0);
+  uint64_t external_memory_after = v8::ExternalMemoryAccounter::
+      GetTotalAmountOfExternalAllocatedMemoryForTesting(isolate);
   // The SharedArrayBuffer constructor does not increase the external memory
   // counter. The counter may decrease however if the allocation triggers GC.
   CHECK_GE(external_memory_before, external_memory_after);
@@ -756,6 +794,8 @@ TEST(BackingStore_ReleaseAllocator_NullptrBackingStore) {
   CHECK(allocator_weak.expired());
 }
 
+START_ALLOW_USE_DEPRECATED()
+
 TEST(BackingStore_ReallocateExpand) {
   LocalContext env;
   v8::Isolate* isolate = env->GetIsolate();
@@ -827,9 +867,9 @@ TEST(BackingStore_ReallocateShared) {
   CHECK(new_backing_store->IsShared());
 }
 
-TEST(ArrayBuffer_Resizable) {
-  FLAG_SCOPE(harmony_rab_gsab);
+END_ALLOW_USE_DEPRECATED()
 
+TEST(ArrayBuffer_Resizable) {
   LocalContext env;
   v8::Isolate* isolate = env->GetIsolate();
   v8::HandleScope handle_scope(isolate);
@@ -851,8 +891,6 @@ TEST(ArrayBuffer_Resizable) {
 }
 
 TEST(ArrayBuffer_FixedLength) {
-  FLAG_SCOPE(harmony_rab_gsab);
-
   LocalContext env;
   v8::Isolate* isolate = env->GetIsolate();
   v8::HandleScope handle_scope(isolate);
@@ -870,4 +908,208 @@ TEST(ArrayBuffer_FixedLength) {
   CHECK_EQ(32, sab->ByteLength());
   CHECK_EQ(32, sab->MaxByteLength());
   CHECK_EQ(sab->MaxByteLength(), sab->GetBackingStore()->MaxByteLength());
+}
+
+THREADED_TEST(ArrayBuffer_DataApiWithEmptyExternal) {
+  LocalContext env;
+  v8::Isolate* isolate = env->GetIsolate();
+  v8::HandleScope handle_scope(isolate);
+
+  Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, 0);
+  void* expected_data_ptr = V8_ENABLE_SANDBOX_BOOL
+                                ? v8::internal::EmptyBackingStoreBuffer()
+                                : nullptr;
+  CHECK_EQ(expected_data_ptr, ab->Data());
+  CHECK_EQ(0, ab->ByteLength());
+  CHECK_NULL(ab->GetBackingStore()->Data());
+  // Repeat test to make sure that accessing the backing store buffer hasn't
+  // changed what sandboxed AB's Data method returns.
+  CHECK_EQ(expected_data_ptr, ab->Data());
+  CHECK_EQ(0, ab->ByteLength());
+
+  void* buffer = CcTest::array_buffer_allocator()->Allocate(1);
+  std::unique_ptr<v8::BackingStore> backing_store =
+      v8::ArrayBuffer::NewBackingStore(buffer, 0,
+                                       v8::BackingStore::EmptyDeleter, nullptr);
+  Local<v8::ArrayBuffer> ab2 =
+      v8::ArrayBuffer::New(isolate, std::move(backing_store));
+  CHECK_EQ(buffer, ab2->Data());
+  CHECK_EQ(0, ab->ByteLength());
+}
+
+namespace {
+void TestArrayBufferViewGetContent(const char* source, void* expected) {
+  LocalContext env;
+  v8::Isolate* isolate = env->GetIsolate();
+  v8::HandleScope handle_scope(isolate);
+
+  auto view = v8::Local<v8::ArrayBufferView>::Cast(CompileRun(source));
+  uint8_t buffer[i::JSTypedArray::kMaxSizeInHeap];
+  v8::MemorySpan<uint8_t> storage(buffer);
+  storage = view->GetContents(storage);
+  CHECK_EQ(view->ByteLength(), storage.size());
+  if (expected) {
+    CHECK_EQ(0, memcmp(storage.data(), expected, view->ByteLength()));
+  } else {
+    CHECK_EQ(0, storage.size());
+  }
+}
+}  // namespace
+
+TEST(ArrayBufferView_GetContentsSmallUint8) {
+  const char* source = "new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9])";
+  uint8_t expected[]{1, 2, 3, 4, 5, 6, 7, 8, 9};
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsLargeUint8) {
+  const char* source =
+      "let array = new Uint8Array(100);"
+      "for (let i = 0; i < 100; ++i) {"
+      "  array[i] = i;"
+      "}"
+      "array";
+  uint8_t expected[100];
+  for (uint8_t i = 0; i < 100; ++i) {
+    expected[i] = i;
+  }
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsUint8View) {
+  const char* source =
+      "let array = new Uint8Array(100);"
+      "for (let i = 0; i < 100; ++i) {"
+      "  array[i] = i;"
+      "}"
+      "new Uint8Array(array.buffer, 70, 9)";
+  uint8_t expected[]{70, 71, 72, 73, 74, 75, 76, 77, 78, 79};
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsSmallUint32) {
+  const char* source = "new Uint16Array([1, 2, 3, 4, 5, 6, 7, 8, 9])";
+  uint16_t expected[]{1, 2, 3, 4, 5, 6, 7, 8, 9};
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsLargeUint16) {
+  const char* source =
+      "let array = new Uint16Array(100);"
+      "for (let i = 0; i < 100; ++i) {"
+      "  array[i] = i;"
+      "}"
+      "array";
+  uint16_t expected[100];
+  for (uint16_t i = 0; i < 100; ++i) {
+    expected[i] = i;
+  }
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsUint16View) {
+  const char* source =
+      "let array = new Uint16Array(100);"
+      "for (let i = 0; i < 100; ++i) {"
+      "  array[i] = i;"
+      "}"
+      "new Uint16Array(array.buffer, 140, 9)";
+  uint16_t expected[]{70, 71, 72, 73, 74, 75, 76, 77, 78, 79};
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsSmallDataView) {
+  const char* source =
+      "let array = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);"
+      "new DataView(array.buffer)";
+  uint8_t expected[]{1, 2, 3, 4, 5, 6, 7, 8, 9};
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsLargeDataView) {
+  const char* source =
+      "let array = new Uint8Array(100);"
+      "for (let i = 0; i < 100; ++i) {"
+      "  array[i] = i;"
+      "}"
+      "new DataView(array.buffer)";
+  uint8_t expected[100];
+  for (uint8_t i = 0; i < 100; ++i) {
+    expected[i] = i;
+  }
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsDataViewWithOffset) {
+  const char* source =
+      "let array = new Uint8Array(100);"
+      "for (let i = 0; i < 100; ++i) {"
+      "  array[i] = i;"
+      "}"
+      "new DataView(array.buffer, 70, 9)";
+  uint8_t expected[]{70, 71, 72, 73, 74, 75, 76, 77, 78, 79};
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsSmallResizableDataView) {
+  const char* source =
+      "let rsab = new ArrayBuffer(10, {maxByteLength: 20});"
+      "let array = new Uint8Array(rsab);"
+      "for (let i = 0; i < 10; ++i) {"
+      "  array[i] = i;"
+      "}"
+      "new DataView(rsab)";
+  uint8_t expected[]{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsResizableTypedArray) {
+  const char* source =
+      "let rsab = new ArrayBuffer(8, {maxByteLength: 8});"
+      "let array = new Uint8Array(rsab);"
+      "for (let i = 0; i < 8; ++i) {"
+      "  array[i] = i;"
+      "};"
+      "array";
+  uint8_t expected[]{0, 1, 2, 3, 4, 5, 6, 7};
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsLargeResizableDataView) {
+  const char* source =
+      "let rsab = new ArrayBuffer(100, {maxByteLength: 200});"
+      "let array = new Uint8Array(rsab);"
+      "for (let i = 0; i < 100; ++i) {"
+      "  array[i] = i;"
+      "}"
+      "new DataView(rsab)";
+  uint8_t expected[100];
+  for (uint8_t i = 0; i < 100; ++i) {
+    expected[i] = i;
+  }
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsResizableDataViewWithOffset) {
+  const char* source =
+      "let rsab = new ArrayBuffer(100, {maxByteLength: 200});"
+      "let array = new Uint8Array(rsab);"
+      "for (let i = 0; i < 100; ++i) {"
+      "  array[i] = i;"
+      "}"
+      "new DataView(rsab, 70, 9)";
+  uint8_t expected[]{70, 71, 72, 73, 74, 75, 76, 77, 78, 79};
+  TestArrayBufferViewGetContent(source, expected);
+}
+
+TEST(ArrayBufferView_GetContentsDetached) {
+  const char* source =
+      "let array = new Uint8Array(100);"
+      "for (let i = 0; i < 100; ++i) {"
+      "  array[i] = i;"
+      "}"
+      "const data_view = new DataView(array.buffer);"
+      "let buffer = array.buffer.transfer();"
+      "data_view";
+  TestArrayBufferViewGetContent(source, nullptr);
 }

@@ -9,6 +9,7 @@
 #include "src/compiler/js-heap-broker.h"
 #include "src/compiler/node-matchers.h"
 #include "src/compiler/simplified-operator.h"
+#include "src/numbers/conversions.h"
 
 namespace v8 {
 namespace internal {
@@ -299,6 +300,7 @@ void JSInliningHeuristic::Finalize() {
     int total_size =
         total_inlined_bytecode_size_ + static_cast<int>(size_of_candidate);
     if (total_size > max_inlined_bytecode_size_cumulative_) {
+      info_->set_could_not_inline_all_candidates();
       // Try if any smaller functions are available to inline.
       continue;
     }
@@ -667,7 +669,7 @@ void JSInliningHeuristic::CreateOrReuseDispatch(
     // TODO(2206): Make comparison be based on underlying SharedFunctionInfo
     // instead of the target JSFunction reference directly.
     Node* target =
-        jsgraph()->Constant(candidate.functions[i].value(), broker());
+        jsgraph()->ConstantNoHole(candidate.functions[i].value(), broker());
     if (i != (*num_calls - 1)) {
       Node* check =
           graph()->NewNode(simplified()->ReferenceEqual(), callee, target);
@@ -789,20 +791,33 @@ Reduction JSInliningHeuristic::InlineCandidate(Candidate const& candidate,
 
 bool JSInliningHeuristic::CandidateCompare::operator()(
     const Candidate& left, const Candidate& right) const {
+  constexpr bool kInlineLeftFirst = true, kInlineRightFirst = false;
   if (right.frequency.IsUnknown()) {
     if (left.frequency.IsUnknown()) {
       // If left and right are both unknown then the ordering is indeterminate,
       // which breaks strict weak ordering requirements, so we fall back to the
       // node id as a tie breaker.
-      return left.node->id() > right.node->id();
+      if (left.total_size < right.total_size) {
+        return kInlineLeftFirst;
+      } else if (left.total_size > right.total_size) {
+        return kInlineRightFirst;
+      } else {
+        return left.node->id() > right.node->id();
+      }
+    } else {
+      return kInlineLeftFirst;
     }
-    return true;
   } else if (left.frequency.IsUnknown()) {
-    return false;
-  } else if (left.frequency.value() > right.frequency.value()) {
-    return true;
-  } else if (left.frequency.value() < right.frequency.value()) {
-    return false;
+    return kInlineRightFirst;
+  }
+
+  int left_score = FastD2IChecked(left.frequency.value() / left.total_size);
+  int right_score = FastD2IChecked(right.frequency.value() / right.total_size);
+
+  if (left_score > right_score) {
+    return kInlineLeftFirst;
+  } else if (left_score < right_score) {
+    return kInlineRightFirst;
   } else {
     return left.node->id() > right.node->id();
   }

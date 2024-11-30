@@ -21,14 +21,14 @@ RUNTIME_FUNCTION(Runtime_IsJSProxy) {
 RUNTIME_FUNCTION(Runtime_JSProxyGetHandler) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(1, args.length());
-  auto proxy = JSProxy::cast(args[0]);
+  auto proxy = Cast<JSProxy>(args[0]);
   return proxy->handler();
 }
 
 RUNTIME_FUNCTION(Runtime_JSProxyGetTarget) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(1, args.length());
-  auto proxy = JSProxy::cast(args[0]);
+  auto proxy = Cast<JSProxy>(args[0]);
   return proxy->target();
 }
 
@@ -38,7 +38,7 @@ RUNTIME_FUNCTION(Runtime_GetPropertyWithReceiver) {
   DCHECK_EQ(4, args.length());
   Handle<JSReceiver> holder = args.at<JSReceiver>(0);
   Handle<Object> key = args.at(1);
-  Handle<Object> receiver = args.at(2);
+  Handle<JSAny> receiver = args.at<JSAny>(2);
   // TODO(mythria): Remove the on_non_existent parameter to this function. This
   // should only be called when getting named properties on receiver. This
   // doesn't handle the global variable loads.
@@ -51,7 +51,7 @@ RUNTIME_FUNCTION(Runtime_GetPropertyWithReceiver) {
   bool success = false;
   PropertyKey lookup_key(isolate, key, &success);
   if (!success) {
-    DCHECK(isolate->has_pending_exception());
+    DCHECK(isolate->has_exception());
     return ReadOnlyRoots(isolate).exception();
   }
   LookupIterator it(isolate, receiver, lookup_key, holder);
@@ -66,12 +66,12 @@ RUNTIME_FUNCTION(Runtime_SetPropertyWithReceiver) {
   Handle<JSReceiver> holder = args.at<JSReceiver>(0);
   Handle<Object> key = args.at(1);
   Handle<Object> value = args.at(2);
-  Handle<Object> receiver = args.at(3);
+  Handle<JSAny> receiver = args.at<JSAny>(3);
 
   bool success = false;
   PropertyKey lookup_key(isolate, key, &success);
   if (!success) {
-    DCHECK(isolate->has_pending_exception());
+    DCHECK(isolate->has_exception());
     return ReadOnlyRoots(isolate).exception();
   }
   LookupIterator it(isolate, receiver, lookup_key, holder);

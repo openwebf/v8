@@ -50,18 +50,24 @@ LocalHandleScope::LocalHandleScope(LocalHeap* local_heap) {
 
 LocalHandleScope::~LocalHandleScope() {
   if (local_heap_->is_main_thread()) {
+#ifdef V8_ENABLE_CHECKS
+    VerifyMainThreadScope();
+#endif
     CloseMainThreadScope(local_heap_, prev_next_, prev_limit_);
   } else {
     CloseScope(local_heap_, prev_next_, prev_limit_);
   }
 }
 
-template <typename T>
-Handle<T> LocalHandleScope::CloseAndEscape(Handle<T> handle_value) {
+template <typename T, template <typename> typename HandleType, typename>
+HandleType<T> LocalHandleScope::CloseAndEscape(HandleType<T> handle_value) {
   HandleScopeData* current;
   Tagged<T> value = *handle_value;
   // Throw away all handles in the current scope.
   if (local_heap_->is_main_thread()) {
+#ifdef V8_ENABLE_CHECKS
+    VerifyMainThreadScope();
+#endif
     current = local_heap_->heap()->isolate()->handle_scope_data();
     CloseMainThreadScope(local_heap_, prev_next_, prev_limit_);
   } else {
@@ -70,7 +76,7 @@ Handle<T> LocalHandleScope::CloseAndEscape(Handle<T> handle_value) {
   }
   // Allocate one handle in the parent scope.
   DCHECK(current->level > current->sealed_level);
-  Handle<T> result(value, local_heap_);
+  HandleType<T> result(value, local_heap_);
   // Reinitialize the current scope (so that it's ready
   // to be used or closed again).
   prev_next_ = current->next;

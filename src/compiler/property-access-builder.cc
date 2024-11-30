@@ -4,7 +4,8 @@
 
 #include "src/compiler/property-access-builder.h"
 
-#include "src/base/optional.h"
+#include <optional>
+
 #include "src/compiler/access-builder.h"
 #include "src/compiler/access-info.h"
 #include "src/compiler/compilation-dependencies.h"
@@ -36,6 +37,19 @@ SimplifiedOperatorBuilder* PropertyAccessBuilder::simplified() const {
 bool HasOnlyStringMaps(JSHeapBroker* broker, ZoneVector<MapRef> const& maps) {
   for (MapRef map : maps) {
     if (!map.IsStringMap()) return false;
+  }
+  return true;
+}
+
+bool HasOnlyStringWrapperMaps(JSHeapBroker* broker,
+                              ZoneVector<MapRef> const& maps) {
+  for (MapRef map : maps) {
+    if (!map.IsJSPrimitiveWrapperMap()) return false;
+    auto elements_kind = map.elements_kind();
+    if (elements_kind != FAST_STRING_WRAPPER_ELEMENTS &&
+        elements_kind != SLOW_STRING_WRAPPER_ELEMENTS) {
+      return false;
+    }
   }
   return true;
 }
@@ -108,11 +122,12 @@ void PropertyAccessBuilder::BuildCheckMaps(Node* object, Effect* effect,
 }
 
 Node* PropertyAccessBuilder::BuildCheckValue(Node* receiver, Effect* effect,
-                                             Control control,
-                                             Handle<HeapObject> value) {
-  HeapObjectMatcher m(receiver);
-  if (m.Is(value)) return receiver;
-  Node* expected = jsgraph()->HeapConstant(value);
+                                             Control control, ObjectRef value) {
+  if (value.IsHeapObject()) {
+    HeapObjectMatcher m(receiver);
+    if (m.Is(value.AsHeapObject().object())) return receiver;
+  }
+  Node* expected = jsgraph()->ConstantNoHole(value, broker());
   Node* check =
       graph()->NewNode(simplified()->ReferenceEqual(), receiver, expected);
   *effect =
@@ -121,11 +136,27 @@ Node* PropertyAccessBuilder::BuildCheckValue(Node* receiver, Effect* effect,
   return expected;
 }
 
+Node* PropertyAccessBuilder::BuildCheckSmi(Node* value, Effect* effect,
+                                           Control control,
+                                           FeedbackSource feedback_source) {
+  Node* smi_value = *effect = graph()->NewNode(
+      simplified()->CheckSmi(feedback_source), value, *effect, control);
+  return smi_value;
+}
+
+Node* PropertyAccessBuilder::BuildCheckNumber(Node* value, Effect* effect,
+                                              Control control,
+                                              FeedbackSource feedback_source) {
+  Node* number = *effect = graph()->NewNode(
+      simplified()->CheckNumber(feedback_source), value, *effect, control);
+  return number;
+}
+
 Node* PropertyAccessBuilder::ResolveHolder(
     PropertyAccessInfo const& access_info, Node* lookup_start_object) {
   OptionalJSObjectRef holder = access_info.holder();
   if (holder.has_value()) {
-    return jsgraph()->Constant(holder.value(), broker());
+    return jsgraph()->ConstantNoHole(holder.value(), broker());
   }
   return lookup_start_object;
 }
@@ -146,7 +177,7 @@ MachineRepresentation PropertyAccessBuilder::ConvertRepresentation(
   }
 }
 
-base::Optional<Node*> PropertyAccessBuilder::FoldLoadDictPrototypeConstant(
+std::optional<Node*> PropertyAccessBuilder::FoldLoadDictPrototypeConstant(
     PropertyAccessInfo const& access_info) {
   DCHECK(V8_DICT_PROPERTY_CONST_TRACKING_BOOL);
   DCHECK(access_info.IsDictionaryProtoDataConstant());
@@ -157,7 +188,7 @@ base::Optional<Node*> PropertyAccessBuilder::FoldLoadDictPrototypeConstant(
   if (!value) return {};
 
   for (MapRef map : access_info.lookup_start_object_maps()) {
-    Handle<Map> map_handle = map.object();
+    DirectHandle<Map> map_handle = map.object();
     // Non-JSReceivers that passed AccessInfoFactory::ComputePropertyAccessInfo
     // must have different lookup start map.
     if (!IsJSReceiverMap(*map_handle)) {
@@ -176,7 +207,7 @@ base::Optional<Node*> PropertyAccessBuilder::FoldLoadDictPrototypeConstant(
         map, access_info.name(), value.value(), PropertyKind::kData);
   }
 
-  return jsgraph()->Constant(value.value(), broker());
+  return jsgraph()->ConstantNoHole(value.value(), broker());
 }
 
 Node* PropertyAccessBuilder::TryFoldLoadConstantDataField(
@@ -190,6 +221,12 @@ Node* PropertyAccessBuilder::TryFoldLoadConstantDataField(
   // If {access_info} has a holder, just use it.
   if (!holder.has_value()) {
     // Otherwise, try to match the {lookup_start_object} as a constant.
+    if (lookup_start_object->opcode() == IrOpcode::kCheckString ||
+        lookup_start_object->opcode() ==
+            IrOpcode::kCheckStringOrStringWrapper) {
+      // Bypassing Check inputs in order to allow constant folding.
+      lookup_start_object = lookup_start_object->InputAt(0);
+    }
     HeapObjectMatcher m(lookup_start_object);
     if (!m.HasResolvedValue() || !m.Ref(broker()).IsJSObject()) return nullptr;
 
@@ -208,14 +245,21 @@ Node* PropertyAccessBuilder::TryFoldLoadConstantDataField(
     holder = m.Ref(broker()).AsJSObject();
   }
 
-  OptionalObjectRef value = holder->GetOwnFastDataProperty(
+  if (access_info.field_representation().IsDouble()) {
+    std::optional<Float64> value = holder->GetOwnFastConstantDoubleProperty(
+        broker(), access_info.field_index(), dependencies());
+    return value.has_value() ? jsgraph()->ConstantNoHole(value->get_scalar())
+                             : nullptr;
+  }
+  OptionalObjectRef value = holder->GetOwnFastConstantDataProperty(
       broker(), access_info.field_representation(), access_info.field_index(),
       dependencies());
-  return value.has_value() ? jsgraph()->Constant(*value, broker()) : nullptr;
+  return value.has_value() ? jsgraph()->ConstantNoHole(*value, broker())
+                           : nullptr;
 }
 
 Node* PropertyAccessBuilder::BuildLoadDataField(NameRef name, Node* holder,
-                                                FieldAccess& field_access,
+                                                FieldAccess&& field_access,
                                                 bool is_inobject, Node** effect,
                                                 Node** control) {
   Node* storage = holder;
@@ -268,8 +312,9 @@ Node* PropertyAccessBuilder::BuildLoadDataField(NameRef name, Node* holder,
       storage = *effect = graph()->NewNode(
           simplified()->LoadField(storage_access), storage, *effect, *control);
     }
-    field_access.offset = HeapNumber::kValueOffset;
-    field_access.name = MaybeHandle<Name>();
+    FieldAccess value_field_access = AccessBuilder::ForHeapNumberValue();
+    value_field_access.const_field_info = field_access.const_field_info;
+    field_access = value_field_access;
   }
   Node* value = *effect = graph()->NewNode(
       simplified()->LoadField(field_access), storage, *effect, *control);
@@ -312,7 +357,7 @@ Node* PropertyAccessBuilder::BuildLoadDataField(
       }
     }
   }
-  return BuildLoadDataField(name, storage, field_access,
+  return BuildLoadDataField(name, storage, std::move(field_access),
                             access_info.field_index().is_inobject(), effect,
                             control);
 }

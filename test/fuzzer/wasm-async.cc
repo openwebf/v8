@@ -21,7 +21,7 @@ namespace v8::internal {
 class WasmModuleObject;
 }
 
-namespace v8::internal::wasm::fuzzer {
+namespace v8::internal::wasm::fuzzing {
 
 class AsyncFuzzerResolver : public CompilationResultResolver {
  public:
@@ -56,9 +56,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
   v8::Isolate::Scope isolate_scope(isolate);
 
-  // Clear any pending exceptions from a prior run.
-  if (i_isolate->has_pending_exception()) {
-    i_isolate->clear_pending_exception();
+  // Clear any exceptions from a prior run.
+  if (i_isolate->has_exception()) {
+    i_isolate->clear_exception();
   }
 
   v8::HandleScope handle_scope(isolate);
@@ -73,12 +73,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   testing::SetupIsolateForWasmModule(i_isolate);
 
   bool done = false;
-  auto enabled_features = WasmFeatures::FromIsolate(i_isolate);
+  auto enabled_features = WasmEnabledFeatures::FromIsolate(i_isolate);
   constexpr const char* kAPIMethodName = "WasmAsyncFuzzer.compile";
+  base::OwnedVector<const uint8_t> bytes = base::OwnedCopyOf(data, size);
   GetWasmEngine()->AsyncCompile(
-      i_isolate, enabled_features,
-      std::make_shared<AsyncFuzzerResolver>(i_isolate, &done),
-      ModuleWireBytes(data, data + size), false, kAPIMethodName);
+      i_isolate, enabled_features, CompileTimeImportsForFuzzing(),
+      std::make_shared<AsyncFuzzerResolver>(i_isolate, &done), std::move(bytes),
+      kAPIMethodName);
 
   // Wait for the promise to resolve.
   while (!done) {
@@ -88,4 +89,4 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   return 0;
 }
 
-}  // namespace v8::internal::wasm::fuzzer
+}  // namespace v8::internal::wasm::fuzzing

@@ -14,33 +14,50 @@ proposal_flags = [
     },
     {
         'name': 'tail-call',
-        'flags': ['--experimental-wasm-return-call']
+        'flags': []
     },
     {
-        'name': 'memory64',
-        'flags': ['--experimental-wasm-memory64']
-    },
-    {
-        'name': 'extended-const',
-        'flags': ['--experimental-wasm-extended-const']
-    },
-    {
-        'name': 'function-references',
-        # Some of these tests need `global.get` to be a constant instruction,
-        # which is part of the GC proposal. We'll ship both proposals at once
-        # anyway, so we might as well enable both for these tests.
+        'name':
+            'memory64',
         'flags': [
-            '--experimental-wasm-typed-funcref', '--experimental-wasm-gc'
+            '--experimental-wasm-memory64',
+            # The memory64 repository is rebased on the upstream 'wasm-3.0'
+            # branch, which contains exnref.
+            '--experimental-wasm-exnref'
         ]
     },
     {
+        'name': 'extended-const',
+        'flags': []
+    },
+    {
+        'name': 'function-references',
+        'flags': []
+    },
+    {
         'name': 'gc',
-        'flags': ['--experimental-wasm-gc', '--wasm-final-types']
+        'flags': []
     },
     {
         'name': 'multi-memory',
         'flags': ['--experimental-wasm-multi-memory']
     },
+    {
+        'name': 'exception-handling',
+        # This flag enables the *new* exception handling proposal. The legacy
+        # proposal is enabled by default.
+        'flags': ['--experimental-wasm-exnref', '--turboshaft-wasm']
+    },
+    {
+        'name':
+            'js-promise-integration',
+        'flags': [
+            '--experimental-wasm-jspi',
+            # The jspi repository is rebased on the upstream 'wasm-3.0'
+            # branch, which contains exnref.
+            '--experimental-wasm-exnref'
+        ]
+    }
 ]
 
 

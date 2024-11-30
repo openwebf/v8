@@ -60,7 +60,7 @@ class OneByteStringStream {
 template <typename IsolateT>
 void AstRawString::Internalize(IsolateT* isolate) {
   DCHECK(!has_string_);
-  if (literal_bytes_.length() == 0) {
+  if (literal_bytes_.empty()) {
     set_string(isolate->factory()->empty_string());
   } else if (is_one_byte()) {
     OneByteStringKey key(raw_hash_field_, literal_bytes_);
@@ -99,7 +99,7 @@ bool AstRawString::IsIntegerIndex() const {
 bool AstRawString::IsOneByteEqualTo(const char* data) const {
   if (!is_one_byte()) return false;
 
-  size_t length = static_cast<size_t>(literal_bytes_.length());
+  size_t length = literal_bytes_.size();
   if (length != strlen(data)) return false;
 
   return 0 == strncmp(reinterpret_cast<const char*>(literal_bytes_.begin()),

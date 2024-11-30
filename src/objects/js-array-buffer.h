@@ -5,6 +5,7 @@
 #ifndef V8_OBJECTS_JS_ARRAY_BUFFER_H_
 #define V8_OBJECTS_JS_ARRAY_BUFFER_H_
 
+#include "include/v8-array-buffer.h"
 #include "include/v8-typed-array.h"
 #include "src/handles/maybe-handles.h"
 #include "src/objects/backing-store.h"
@@ -23,7 +24,7 @@ class ArrayBufferExtension;
 
 class JSArrayBuffer
     : public TorqueGeneratedJSArrayBuffer<JSArrayBuffer,
-                                          JSObjectWithEmbedderSlots> {
+                                          JSAPIObjectWithEmbedderSlots> {
  public:
 // The maximum length for JSArrayBuffer's supported by V8.
 // On 32-bit architectures we limit this to 2GiB, so that
@@ -50,6 +51,7 @@ class JSArrayBuffer
 
   // [extension]: extension object used for GC
   DECL_PRIMITIVE_ACCESSORS(extension, ArrayBufferExtension*)
+  inline void init_extension();
 
   // [bit_field]: boolean flags
   DECL_PRIMITIVE_ACCESSORS(bit_field, uint32_t)
@@ -110,7 +112,7 @@ class JSArrayBuffer
   // is used by the implementation of Wasm memory growth in order to bypass the
   // non-detachable check.
   V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT static Maybe<bool> Detach(
-      Handle<JSArrayBuffer> buffer, bool force_for_wasm_memory = false,
+      DirectHandle<JSArrayBuffer> buffer, bool force_for_wasm_memory = false,
       Handle<Object> key = Handle<Object>());
 
   // Get a reference to backing store of this array buffer, if there is a
@@ -129,7 +131,7 @@ class JSArrayBuffer
 
   // Allocates an ArrayBufferExtension for this array buffer, unless it is
   // already associated with an extension.
-  ArrayBufferExtension* EnsureExtension();
+  V8_EXPORT_PRIVATE ArrayBufferExtension* EnsureExtension();
 
   // Frees the associated ArrayBufferExtension and returns its backing store.
   std::shared_ptr<BackingStore> RemoveExtension();
@@ -154,11 +156,11 @@ class JSArrayBuffer
   DECL_PRINTER(JSArrayBuffer)
   DECL_VERIFIER(JSArrayBuffer)
 
-  static constexpr int kEndOfTaggedFieldsOffset = kRawByteLengthOffset;
-
-  static const int kSizeWithEmbedderFields =
+  static constexpr int kSizeWithEmbedderFields =
       kHeaderSize +
       v8::ArrayBuffer::kEmbedderFieldCount * kEmbedderDataSlotSize;
+  static constexpr bool kContainsEmbedderFields =
+      v8::ArrayBuffer::kEmbedderFieldCount > 0;
 
   class BodyDescriptor;
 
@@ -184,8 +186,31 @@ class JSArrayBuffer
 // extension-object. The GC periodically iterates all extensions concurrently
 // and frees unmarked ones.
 // https://docs.google.com/document/d/1-ZrLdlFX1nXT3z-FAgLbKal1gI8Auiaya_My-a0UJ28/edit
-class ArrayBufferExtension final : public Malloced {
+class ArrayBufferExtension final
+#ifdef V8_COMPRESS_POINTERS
+    : public ExternalPointerTable::ManagedResource {
+#else
+    : public Malloced {
+#endif  // V8_COMPRESS_POINTERS
+  static constexpr uint64_t kAgeMask = 1;
+  static constexpr uint64_t kAccountingLengthBitOffset = 1;
+
  public:
+  enum class Age : uint8_t { kYoung = 0, kOld = 1 };
+
+  // Packs `accounting_length` and `age` into a single integer for consistent
+  // accounting, allowing resize while concurrently sweeping.
+  struct AccountingState {
+    size_t accounting_length() const {
+      DCHECK_LE(value >> kAccountingLengthBitOffset,
+                std::numeric_limits<size_t>::max());
+      return static_cast<size_t>(value >> kAccountingLengthBitOffset);
+    }
+    Age age() const { return static_cast<Age>(value & kAgeMask); }
+
+    uint64_t value;
+  };
+
   ArrayBufferExtension() : backing_store_(std::shared_ptr<BackingStore>()) {}
   explicit ArrayBufferExtension(std::shared_ptr<BackingStore> backing_store)
       : backing_store_(backing_store) {}
@@ -205,15 +230,27 @@ class ArrayBufferExtension final : public Malloced {
   BackingStore* backing_store_raw() { return backing_store_.get(); }
 
   size_t accounting_length() const {
-    return accounting_length_.load(std::memory_order_relaxed);
+    return AccountingState{accounting_state_.load(std::memory_order_relaxed)}
+        .accounting_length();
+  }
+  void set_accounting_state(size_t accounting_length, Age age) {
+    accounting_state_.store((static_cast<uint64_t>(accounting_length)
+                             << kAccountingLengthBitOffset) |
+                                static_cast<uint8_t>(age),
+                            std::memory_order_relaxed);
   }
 
-  void set_accounting_length(size_t accounting_length) {
-    accounting_length_.store(accounting_length, std::memory_order_relaxed);
+  // Applies `delta` to `accounting_length` and returns the AccountingState
+  // before the update.
+  AccountingState UpdateAccountingLength(int64_t delta) {
+    return {accounting_state_.fetch_add(delta << kAccountingLengthBitOffset,
+                                        std::memory_order_relaxed)};
   }
 
-  size_t ClearAccountingLength() {
-    return accounting_length_.exchange(0, std::memory_order_relaxed);
+  // Clears `accounting_length` and returns the AccountingState before the
+  // update.
+  AccountingState ClearAccountingLength() {
+    return {accounting_state_.fetch_and(kAgeMask, std::memory_order_relaxed)};
   }
 
   std::shared_ptr<BackingStore> RemoveBackingStore() {
@@ -229,6 +266,18 @@ class ArrayBufferExtension final : public Malloced {
   ArrayBufferExtension* next() const { return next_; }
   void set_next(ArrayBufferExtension* extension) { next_ = extension; }
 
+  Age age() const {
+    return AccountingState{accounting_state_.load(std::memory_order_relaxed)}
+        .age();
+  }
+  // Updates `age` and returns the AccountingState before the update.
+  AccountingState SetOld() {
+    return {accounting_state_.fetch_or(kAgeMask, std::memory_order_relaxed)};
+  }
+  AccountingState SetYoung() {
+    return {accounting_state_.fetch_and(~kAgeMask, std::memory_order_relaxed)};
+  }
+
  private:
   enum class GcState : uint8_t { Dead = 0, Copied, Promoted };
 
@@ -236,7 +285,7 @@ class ArrayBufferExtension final : public Malloced {
   std::atomic<GcState> young_gc_state_{GcState::Dead};
   std::shared_ptr<BackingStore> backing_store_;
   ArrayBufferExtension* next_ = nullptr;
-  std::atomic<size_t> accounting_length_{0};
+  std::atomic<uint64_t> accounting_state_{kAgeMask};
 
   GcState young_gc_state() const {
     return young_gc_state_.load(std::memory_order_relaxed);
@@ -249,8 +298,10 @@ class ArrayBufferExtension final : public Malloced {
 
 class JSArrayBufferView
     : public TorqueGeneratedJSArrayBufferView<JSArrayBufferView,
-                                              JSObjectWithEmbedderSlots> {
+                                              JSAPIObjectWithEmbedderSlots> {
  public:
+  class BodyDescriptor;
+
   // [byte_offset]: offset of typed array in bytes.
   DECL_PRIMITIVE_ACCESSORS(byte_offset, size_t)
 
@@ -267,8 +318,6 @@ class JSArrayBufferView
   DECL_BOOLEAN_ACCESSORS(is_length_tracking)
   DECL_BOOLEAN_ACCESSORS(is_backed_by_rab)
   inline bool IsVariableLength() const;
-
-  static constexpr int kEndOfTaggedFieldsOffset = kRawByteOffsetOffset;
 
   static_assert(IsAligned(kRawByteOffsetOffset, kUIntptrSize));
   static_assert(IsAligned(kRawByteLengthOffset, kUIntptrSize));
@@ -370,9 +419,11 @@ class JSTypedArray
   // static_assert(IsAligned(kLengthOffset, kTaggedSize));
   // static_assert(IsAligned(kExternalPointerOffset, kTaggedSize));
 
-  static const int kSizeWithEmbedderFields =
+  static constexpr int kSizeWithEmbedderFields =
       kHeaderSize +
       v8::ArrayBufferView::kEmbedderFieldCount * kEmbedderDataSlotSize;
+  static constexpr bool kContainsEmbedderFields =
+      v8::ArrayBufferView::kEmbedderFieldCount > 0;
 
   class BodyDescriptor;
 
@@ -413,9 +464,11 @@ class JSDataViewOrRabGsabDataView
   // TODO(v8:9287): Re-enable when GCMole stops mixing 32/64 bit configs.
   // static_assert(IsAligned(kDataPointerOffset, kTaggedSize));
 
-  static const int kSizeWithEmbedderFields =
+  static constexpr int kSizeWithEmbedderFields =
       kHeaderSize +
       v8::ArrayBufferView::kEmbedderFieldCount * kEmbedderDataSlotSize;
+  static constexpr bool kContainsEmbedderFields =
+      v8::ArrayBufferView::kEmbedderFieldCount > 0;
 
   class BodyDescriptor;
 

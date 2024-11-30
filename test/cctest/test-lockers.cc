@@ -526,7 +526,7 @@ class SeparateIsolatesLocksNonexclusiveThread : public JoinableThread {
 // Run parallel threads that lock and access different isolates in parallel
 TEST(SeparateIsolatesLocksNonexclusive) {
   v8_flags.always_turbofan = false;
-#if V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_S390
+#if V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_S390X
   const int kNThreads = 50;
 #else
   const int kNThreads = 100;
@@ -611,7 +611,7 @@ class LockerUnlockerThread : public JoinableThread {
 // Use unlocker inside of a Locker, multiple threads.
 TEST(LockerUnlocker) {
   v8_flags.always_turbofan = false;
-#if V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_S390
+#if V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_S390X
   const int kNThreads = 50;
 #else
   const int kNThreads = 100;
@@ -669,7 +669,7 @@ class LockTwiceAndUnlockThread : public JoinableThread {
 // Use Unlocker inside two Lockers.
 TEST(LockTwiceAndUnlock) {
   v8_flags.always_turbofan = false;
-#if V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_S390
+#if V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_S390X
   const int kNThreads = 50;
 #else
   const int kNThreads = 100;
@@ -861,19 +861,18 @@ TEST(LockUnlockLockDefaultIsolateMultithreaded) {
 #else
   const int kNThreads = 100;
 #endif
-  Local<v8::Context> context;
   std::vector<JoinableThread*> threads;
   threads.reserve(kNThreads);
+  CcTest::isolate()->Exit();
   {
     v8::Locker locker_(CcTest::isolate());
     v8::Isolate::Scope isolate_scope(CcTest::isolate());
     v8::HandleScope handle_scope(CcTest::isolate());
-    context = v8::Context::New(CcTest::isolate());
+    Local<v8::Context> context = v8::Context::New(CcTest::isolate());
     for (int i = 0; i < kNThreads; i++) {
       threads.push_back(new LockUnlockLockDefaultIsolateThread(context));
     }
   }
-  CcTest::isolate()->Exit();
   StartJoinAndDeleteThreads(threads);
   CcTest::isolate()->Enter();
 }
@@ -937,8 +936,6 @@ class IsolateGenesisThread : public JoinableThread {
 // http://code.google.com/p/v8/issues/detail?id=1821
 TEST(ExtensionsRegistration) {
 #if V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_MIPS
-  const int kNThreads = 10;
-#elif V8_TARGET_ARCH_S390 && V8_TARGET_ARCH_32_BIT
   const int kNThreads = 10;
 #else
   const int kNThreads = 40;

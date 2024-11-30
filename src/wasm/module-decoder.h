@@ -84,44 +84,39 @@ enum class DecodingMethod {
   kDeserialize
 };
 
-enum PopulateExplicitRecGroups {
-  kDoNotPopulateExplicitRecGroups,
-  kPopulateExplicitRecGroups
-};
-
 // Decodes the bytes of a wasm module in {wire_bytes} while recording events and
 // updating counters.
 V8_EXPORT_PRIVATE ModuleResult DecodeWasmModule(
-    WasmFeatures enabled_features, base::Vector<const uint8_t> wire_bytes,
-    bool validate_functions, ModuleOrigin origin, Counters* counters,
+    WasmEnabledFeatures enabled_features,
+    base::Vector<const uint8_t> wire_bytes, bool validate_functions,
+    ModuleOrigin origin, Counters* counters,
     std::shared_ptr<metrics::Recorder> metrics_recorder,
-    v8::metrics::Recorder::ContextId context_id,
-    DecodingMethod decoding_method);
+    v8::metrics::Recorder::ContextId context_id, DecodingMethod decoding_method,
+    WasmDetectedFeatures* detected_features);
 // Decodes the bytes of a wasm module in {wire_bytes} without recording events
 // or updating counters.
 V8_EXPORT_PRIVATE ModuleResult DecodeWasmModule(
-    WasmFeatures enabled_features, base::Vector<const uint8_t> wire_bytes,
-    bool validate_functions, ModuleOrigin origin,
-    PopulateExplicitRecGroups populate_explicit_rec_groups =
-        kDoNotPopulateExplicitRecGroups);
+    WasmEnabledFeatures enabled_features,
+    base::Vector<const uint8_t> wire_bytes, bool validate_functions,
+    ModuleOrigin origin, WasmDetectedFeatures* detected_features);
 // Stripped down version for disassembler needs.
-V8_EXPORT_PRIVATE ModuleResult
-DecodeWasmModuleForDisassembler(base::Vector<const uint8_t> wire_bytes);
+V8_EXPORT_PRIVATE ModuleResult DecodeWasmModuleForDisassembler(
+    base::Vector<const uint8_t> wire_bytes, ITracer* tracer);
 
 // Exposed for testing. Decodes a single function signature, allocating it
 // in the given zone.
 V8_EXPORT_PRIVATE Result<const FunctionSig*> DecodeWasmSignatureForTesting(
-    WasmFeatures enabled_features, Zone* zone,
+    WasmEnabledFeatures enabled_features, Zone* zone,
     base::Vector<const uint8_t> bytes);
 
 // Decodes the bytes of a wasm function in {function_bytes} (part of
 // {wire_bytes}).
 V8_EXPORT_PRIVATE FunctionResult DecodeWasmFunctionForTesting(
-    WasmFeatures enabled, Zone* zone, ModuleWireBytes wire_bytes,
+    WasmEnabledFeatures enabled, Zone* zone, ModuleWireBytes wire_bytes,
     const WasmModule* module, base::Vector<const uint8_t> function_bytes);
 
 V8_EXPORT_PRIVATE ConstantExpression DecodeWasmInitExprForTesting(
-    WasmFeatures enabled_features, base::Vector<const uint8_t> bytes,
+    WasmEnabledFeatures enabled_features, base::Vector<const uint8_t> bytes,
     ValueType expected);
 
 struct CustomSectionOffset {
@@ -149,8 +144,9 @@ void DecodeFunctionNames(base::Vector<const uint8_t> wire_bytes,
 // valid. {filter} determines which functions are validated. Pass an empty
 // function for "all functions". The {filter} callback needs to be thread-safe.
 V8_EXPORT_PRIVATE WasmError ValidateFunctions(
-    const WasmModule*, WasmFeatures enabled_features,
-    base::Vector<const uint8_t> wire_bytes, std::function<bool(int)> filter);
+    const WasmModule*, WasmEnabledFeatures enabled_features,
+    base::Vector<const uint8_t> wire_bytes, std::function<bool(int)> filter,
+    WasmDetectedFeatures* detected_features);
 
 WasmError GetWasmErrorWithName(base::Vector<const uint8_t> wire_bytes,
                                int func_index, const WasmModule* module,
@@ -160,7 +156,8 @@ class ModuleDecoderImpl;
 
 class ModuleDecoder {
  public:
-  explicit ModuleDecoder(WasmFeatures enabled_feature);
+  explicit ModuleDecoder(WasmEnabledFeatures enabled_features,
+                         WasmDetectedFeatures* detected_features);
   ~ModuleDecoder();
 
   void DecodeModuleHeader(base::Vector<const uint8_t> bytes);
@@ -180,7 +177,7 @@ class ModuleDecoder {
 
   WasmModule* module() const { return shared_module().get(); }
 
-  bool ok();
+  bool ok() const;
 
   // Translates the unknown section that decoder is pointing to to an extended
   // SectionCode if the unknown section is known to decoder.

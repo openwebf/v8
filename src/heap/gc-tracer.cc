@@ -5,11 +5,12 @@
 #include "src/heap/gc-tracer.h"
 
 #include <cstdarg>
+#include <limits>
+#include <optional>
 
 #include "include/v8-metrics.h"
 #include "src/base/atomic-utils.h"
 #include "src/base/logging.h"
-#include "src/base/optional.h"
 #include "src/base/platform/time.h"
 #include "src/base/strings.h"
 #include "src/common/globals.h"
@@ -51,29 +52,31 @@ CollectionEpoch next_epoch() {
 
 using BytesAndDuration = ::heap::base::BytesAndDuration;
 
-double BoundedAverageSpeed(
-    const base::RingBuffer<BytesAndDuration>& buffer,
-    v8::base::Optional<v8::base::TimeDelta> selected_duration) {
+std::optional<double> BoundedAverageSpeed(
+    const base::RingBuffer<BytesAndDuration>& buffer) {
   constexpr size_t kMinNonEmptySpeedInBytesPerMs = 1;
   constexpr size_t kMaxSpeedInBytesPerMs = GB;
-  return ::heap::base::AverageSpeed(
-      buffer, BytesAndDuration(), selected_duration,
-      kMinNonEmptySpeedInBytesPerMs, kMaxSpeedInBytesPerMs);
+  return ::heap::base::AverageSpeed(buffer, BytesAndDuration(), std::nullopt,
+                                    kMinNonEmptySpeedInBytesPerMs,
+                                    kMaxSpeedInBytesPerMs);
 }
 
-double BoundedAverageSpeed(const base::RingBuffer<BytesAndDuration>& buffer) {
-  return BoundedAverageSpeed(buffer, base::nullopt);
+double BoundedThroughput(const ::heap::base::SmoothedBytesAndDuration& buffer) {
+  constexpr double kMaxSpeedInBytesPerMs = static_cast<double>(GB);
+  return std::min(buffer.GetThroughput(), kMaxSpeedInBytesPerMs);
 }
 
 }  // namespace
 
 GCTracer::Event::Event(Type type, State state,
                        GarbageCollectionReason gc_reason,
-                       const char* collector_reason)
+                       const char* collector_reason,
+                       GCTracer::Priority priority)
     : type(type),
       state(state),
       gc_reason(gc_reason),
-      collector_reason(collector_reason) {}
+      collector_reason(collector_reason),
+      priority(priority) {}
 
 const char* ToString(GCTracer::Event::Type type, bool short_name) {
   switch (type) {
@@ -105,7 +108,7 @@ GCTracer::RecordGCPhasesInfo::RecordGCPhasesInfo(
   } else {
     DCHECK_EQ(GarbageCollector::MARK_COMPACTOR, collector);
     Counters* counters = heap->isolate()->counters();
-    const bool in_background = heap->isolate()->IsIsolateInBackground();
+    const bool in_background = heap->isolate()->is_backgrounded();
     const bool is_incremental = !heap->incremental_marking()->IsStopped();
     mode_ = Mode::None;
     // The following block selects histogram counters to emit. The trace event
@@ -172,7 +175,7 @@ GCTracer::GCTracer(Heap* heap, base::TimeTicks startup_time,
                    GarbageCollectionReason initial_gc_reason)
     : heap_(heap),
       current_(Event::Type::START, Event::State::NOT_RUNNING, initial_gc_reason,
-               nullptr),
+               nullptr, heap_->isolate()->priority()),
       previous_(current_),
       allocation_time_(startup_time),
       previous_mark_compact_end_time_(startup_time) {
@@ -189,9 +192,10 @@ GCTracer::GCTracer(Heap* heap, base::TimeTicks startup_time,
 }
 
 void GCTracer::ResetForTesting() {
+  auto* heap = heap_;
   this->~GCTracer();
-  new (this) GCTracer(heap_, base::TimeTicks::Now(),
-                      GarbageCollectionReason::kTesting);
+  new (this)
+      GCTracer(heap, base::TimeTicks::Now(), GarbageCollectionReason::kTesting);
 }
 
 void GCTracer::StartObservablePause(base::TimeTicks time) {
@@ -226,6 +230,8 @@ void GCTracer::StartCycle(GarbageCollector collector,
   DCHECK(!young_gc_while_full_gc_);
 
   young_gc_while_full_gc_ = current_.state != Event::State::NOT_RUNNING;
+  CHECK_IMPLIES(v8_flags.separate_gc_phases && young_gc_while_full_gc_,
+                current_.state == Event::State::SWEEPING);
   if (young_gc_while_full_gc_) {
     // The cases for interruption are: Scavenger, MinorMS interrupting sweeping.
     // In both cases we are fine with fetching background counters now and
@@ -260,7 +266,8 @@ void GCTracer::StartCycle(GarbageCollector collector,
   DCHECK_EQ(Event::State::NOT_RUNNING, previous_.state);
 
   previous_ = current_;
-  current_ = Event(type, Event::State::MARKING, gc_reason, collector_reason);
+  current_ = Event(type, Event::State::MARKING, gc_reason, collector_reason,
+                   heap_->isolate()->priority());
 
   switch (marking) {
     case MarkingType::kAtomic:
@@ -340,23 +347,16 @@ void GCTracer::StopObservablePause(GarbageCollector collector,
   auto* long_task_stats = heap_->isolate()->GetCurrentLongTaskStats();
   const bool is_young = Heap::IsYoungGenerationCollector(collector);
   if (is_young) {
-    recorded_minor_gcs_total_.Push(
-        BytesAndDuration(current_.young_object_size, duration));
-    recorded_minor_gcs_survived_.Push(
+    recorded_minor_gc_atomic_pause_.Push(
         BytesAndDuration(current_.survived_young_object_size, duration));
     long_task_stats->gc_young_wall_clock_duration_us +=
         duration.InMicroseconds();
   } else {
-    DCHECK_EQ(0u, current_.incremental_marking_bytes);
-    DCHECK(current_.incremental_marking_duration.IsZero());
     if (current_.type == Event::Type::INCREMENTAL_MARK_COMPACTOR) {
-      RecordIncrementalMarkingSpeed(incremental_marking_bytes_,
-                                    incremental_marking_duration_);
+      RecordIncrementalMarkingSpeed(current_.incremental_marking_bytes,
+                                    current_.incremental_marking_duration);
       recorded_incremental_mark_compacts_.Push(
           BytesAndDuration(current_.end_object_size, duration));
-      std::swap(current_.incremental_marking_bytes, incremental_marking_bytes_);
-      std::swap(current_.incremental_marking_duration,
-                incremental_marking_duration_);
       for (int i = 0; i < Scope::NUMBER_OF_INCREMENTAL_SCOPES; i++) {
         current_.incremental_scopes[i] = incremental_scopes_[i];
         current_.scopes[i] = incremental_scopes_[i].duration;
@@ -365,15 +365,15 @@ void GCTracer::StopObservablePause(GarbageCollector collector,
     } else {
       recorded_mark_compacts_.Push(
           BytesAndDuration(current_.end_object_size, duration));
-      DCHECK_EQ(0u, incremental_marking_bytes_);
-      DCHECK(incremental_marking_duration_.IsZero());
+      DCHECK_EQ(0u, current_.incremental_marking_bytes);
+      DCHECK(current_.incremental_marking_duration.IsZero());
     }
     RecordGCSumCounters();
     combined_mark_compact_speed_cache_ = 0.0;
     long_task_stats->gc_full_atomic_wall_clock_duration_us +=
         duration.InMicroseconds();
     RecordMutatorUtilization(current_.end_time,
-                             duration + incremental_marking_duration_);
+                             duration + current_.incremental_marking_duration);
   }
 
   heap_->UpdateTotalGCTime(duration);
@@ -433,6 +433,23 @@ void GCTracer::StopAtomicPause() {
   current_.state = Event::State::SWEEPING;
 }
 
+namespace {
+
+// Estimate of young generation wall time across all threads up to and including
+// the atomic pause.
+constexpr v8::base::TimeDelta YoungGenerationWallTime(
+    const GCTracer::Event& event) {
+  return
+      // Scavenger events.
+      event.scopes[GCTracer::Scope::SCAVENGER] +
+      event.scopes[GCTracer::Scope::SCAVENGER_BACKGROUND_SCAVENGE_PARALLEL] +
+      // Minor MS events.
+      event.scopes[GCTracer::Scope::MINOR_MS] +
+      event.scopes[GCTracer::Scope::MINOR_MS_BACKGROUND_MARKING];
+}
+
+}  // namespace
+
 void GCTracer::StopCycle(GarbageCollector collector) {
   DCHECK_EQ(Event::State::SWEEPING, current_.state);
   current_.state = Event::State::NOT_RUNNING;
@@ -443,6 +460,11 @@ void GCTracer::StopCycle(GarbageCollector collector) {
 
   if (Heap::IsYoungGenerationCollector(collector)) {
     ReportYoungCycleToRecorder();
+
+    const v8::base::TimeDelta per_thread_wall_time =
+        YoungGenerationWallTime(current_) / current_.concurrency_estimate;
+    recorded_minor_gc_per_thread_.Push(BytesAndDuration(
+        current_.survived_young_object_size, per_thread_wall_time));
 
     // If a young generation GC interrupted an unfinished full GC cycle, restore
     // the event corresponding to the full GC cycle.
@@ -599,14 +621,13 @@ void GCTracer::SampleAllocation(base::TimeTicks current,
                                 size_t new_space_counter_bytes,
                                 size_t old_generation_counter_bytes,
                                 size_t embedder_counter_bytes) {
-  // This assumes that counters are unsigned integers so that the subtraction
-  // below works even if the new counter is less than the old counter.
-  size_t new_space_allocated_bytes =
-      new_space_counter_bytes - new_space_allocation_counter_bytes_;
-  size_t old_generation_allocated_bytes =
-      old_generation_counter_bytes - old_generation_allocation_counter_bytes_;
-  size_t embedder_allocated_bytes =
-      embedder_counter_bytes - embedder_allocation_counter_bytes_;
+  int64_t new_space_allocated_bytes = std::max<int64_t>(
+      new_space_counter_bytes - new_space_allocation_counter_bytes_, 0);
+  int64_t old_generation_allocated_bytes = std::max<int64_t>(
+      old_generation_counter_bytes - old_generation_allocation_counter_bytes_,
+      0);
+  int64_t embedder_allocated_bytes = std::max<int64_t>(
+      embedder_counter_bytes - embedder_allocation_counter_bytes_, 0);
   const base::TimeDelta allocation_duration = current - allocation_time_;
   allocation_time_ = current;
 
@@ -614,11 +635,11 @@ void GCTracer::SampleAllocation(base::TimeTicks current,
   old_generation_allocation_counter_bytes_ = old_generation_counter_bytes;
   embedder_allocation_counter_bytes_ = embedder_counter_bytes;
 
-  recorded_new_generation_allocations_.Push(
+  new_generation_allocations_.Update(
       BytesAndDuration(new_space_allocated_bytes, allocation_duration));
-  recorded_old_generation_allocations_.Push(
+  old_generation_allocations_.Update(
       BytesAndDuration(old_generation_allocated_bytes, allocation_duration));
-  recorded_embedder_generation_allocations_.Push(
+  embedder_generation_allocations_.Update(
       BytesAndDuration(embedder_allocated_bytes, allocation_duration));
 
   if (v8_flags.memory_balancer) {
@@ -627,27 +648,45 @@ void GCTracer::SampleAllocation(base::TimeTicks current,
   }
 }
 
+void GCTracer::SampleConcurrencyEsimate(size_t concurrency) {
+  // For now, we only expect a single sample.
+  DCHECK_EQ(current_.concurrency_estimate, 1);
+  DCHECK_GT(concurrency, 0);
+  current_.concurrency_estimate = concurrency;
+}
+
 void GCTracer::NotifyMarkingStart() {
   const auto marking_start = base::TimeTicks::Now();
 
-  uint16_t result = 1;
-  if (last_marking_start_time_.has_value()) {
-    const double diff_in_seconds = std::round(
-        (marking_start - last_marking_start_time_.value()).InSecondsF());
-    if (diff_in_seconds > UINT16_MAX) {
-      result = UINT16_MAX;
-    } else if (diff_in_seconds >= 1) {
-      result = static_cast<uint16_t>(diff_in_seconds);
+  // Handle code flushing time deltas. Times are incremented conservatively:
+  // 1. The first delta is 0s.
+  // 2. Any delta is rounded downwards to a full second.
+  // 3. 0s-deltas are carried over to the next GC with their precise diff. This
+  //    allows for frequent GCs (within a single second) to be attributed
+  //    correctly later on.
+  // 4. The first non-zero increment after a reset always just increments by 1s.
+  using SFIAgeType = decltype(code_flushing_increase_s_);
+  static_assert(SharedFunctionInfo::kAgeSize == sizeof(SFIAgeType));
+  static constexpr auto kMaxDeltaForSFIAge =
+      base::TimeDelta::FromSeconds(std::numeric_limits<SFIAgeType>::max());
+  SFIAgeType code_flushing_increase_s = 0;
+  if (last_marking_start_time_for_code_flushing_.has_value()) {
+    const auto diff =
+        marking_start - last_marking_start_time_for_code_flushing_.value();
+    if (diff > kMaxDeltaForSFIAge) {
+      code_flushing_increase_s = std::numeric_limits<SFIAgeType>::max();
+    } else {
+      code_flushing_increase_s = static_cast<SFIAgeType>(diff.InSeconds());
     }
   }
-  DCHECK_GT(result, 0);
-  DCHECK_LE(result, UINT16_MAX);
-
-  code_flushing_increase_s_ = result;
-  last_marking_start_time_ = marking_start;
-
+  DCHECK_LE(code_flushing_increase_s, std::numeric_limits<SFIAgeType>::max());
+  code_flushing_increase_s_ = code_flushing_increase_s;
+  if (!last_marking_start_time_for_code_flushing_.has_value() ||
+      code_flushing_increase_s > 0) {
+    last_marking_start_time_for_code_flushing_ = marking_start;
+  }
   if (V8_UNLIKELY(v8_flags.trace_flush_code)) {
-    PrintIsolate(heap_->isolate(), "code flushing time: %d second(s)\n",
+    PrintIsolate(heap_->isolate(), "code flushing: increasing time: %u s\n",
                  code_flushing_increase_s_);
   }
 }
@@ -668,8 +707,8 @@ void GCTracer::AddSurvivalRatio(double promotion_ratio) {
 
 void GCTracer::AddIncrementalMarkingStep(double duration, size_t bytes) {
   if (bytes > 0) {
-    incremental_marking_bytes_ += bytes;
-    incremental_marking_duration_ +=
+    current_.incremental_marking_bytes += bytes;
+    current_.incremental_marking_duration +=
         base::TimeDelta::FromMillisecondsD(duration);
   }
   ReportIncrementalMarkingStepToRecorder(duration);
@@ -711,7 +750,7 @@ void GCTracer::Print() const {
         current_scope(Scope::MC_INCREMENTAL),
         incremental_scope(Scope::MC_INCREMENTAL).steps,
         incremental_scope(Scope::MC_INCREMENTAL).longest_step.InMillisecondsF(),
-        (current_.end_time - incremental_marking_start_time_)
+        (current_.end_time - current_.incremental_marking_start_time)
             .InMillisecondsF());
   }
 
@@ -724,19 +763,26 @@ void GCTracer::Print() const {
 
   // Avoid PrintF as Output also appends the string to the tracing ring buffer
   // that gets printed on OOM failures.
+  DCHECK_IMPLIES(young_gc_while_full_gc_,
+                 Event::IsYoungGenerationEvent(current_.type));
   Output(
       "[%d:%p] "
       "%8.0f ms: "
-      "%s%s %.1f (%.1f) -> %.1f (%.1f) MB, "
+      "%s%s%s %.1f (%.1f) -> %.1f (%.1f) MB, "
+      "pooled: %1.f MB, "
       "%.2f / %.2f ms %s (average mu = %.3f, current mu = %.3f) %s; %s\n",
       base::OS::GetCurrentProcessId(),
       reinterpret_cast<void*>(heap_->isolate()),
       heap_->isolate()->time_millis_since_init(),
       ToString(current_.type, false), current_.reduce_memory ? " (reduce)" : "",
+      young_gc_while_full_gc_ ? " (interleaved)" : "",
       static_cast<double>(current_.start_object_size) / MB,
       static_cast<double>(current_.start_memory_size) / MB,
       static_cast<double>(current_.end_object_size) / MB,
       static_cast<double>(current_.end_memory_size) / MB,
+      static_cast<double>(
+          heap_->memory_allocator()->pool()->CommittedBufferedMemory()) /
+          MB,
       duration.InMillisecondsF(), total_external_time, incremental_buffer,
       AverageMarkCompactMutatorUtilization(),
       CurrentMarkCompactMutatorUtilization(), ToString(current_.gc_reason),
@@ -753,7 +799,7 @@ void GCTracer::PrintNVP() const {
   base::TimeDelta incremental_walltime_duration;
   if (current_.type == Event::Type::INCREMENTAL_MARK_COMPACTOR) {
     incremental_walltime_duration =
-        current_.end_time - incremental_marking_start_time_;
+        current_.end_time - current_.incremental_marking_start_time;
   }
 
   // Avoid data races when printing the background scopes.
@@ -766,14 +812,13 @@ void GCTracer::PrintNVP() const {
           "mutator=%.1f "
           "gc=%s "
           "reduce_memory=%d "
+          "interleaved=%d "
           "time_to_safepoint=%.2f "
           "heap.prologue=%.2f "
           "heap.epilogue=%.2f "
-          "heap.epilogue.reduce_new_space=%.2f "
           "heap.external.prologue=%.2f "
           "heap.external.epilogue=%.2f "
           "heap.external_weak_global_handles=%.2f "
-          "fast_promote=%.2f "
           "complete.sweep_array_buffers=%.2f "
           "scavenge=%.2f "
           "scavenge.free_remembered_set=%.2f "
@@ -785,8 +830,6 @@ void GCTracer::PrintNVP() const {
           "scavenge.update_refs=%.2f "
           "scavenge.sweep_array_buffers=%.2f "
           "background.scavenge.parallel=%.2f "
-          "background.unmapper=%.2f "
-          "unmapper=%.2f "
           "incremental.steps_count=%d "
           "incremental.steps_took=%.1f "
           "scavenge_throughput=%.f "
@@ -805,17 +848,16 @@ void GCTracer::PrintNVP() const {
           "promotion_rate=%.1f%% "
           "new_space_survive_rate_=%.1f%% "
           "new_space_allocation_throughput=%.1f "
-          "unmapper_chunks=%d\n",
+          "pool_chunks=%zu\n",
           duration.InMillisecondsF(), spent_in_mutator.InMillisecondsF(),
           ToString(current_.type, true), current_.reduce_memory,
+          young_gc_while_full_gc_,
           current_.scopes[Scope::TIME_TO_SAFEPOINT].InMillisecondsF(),
           current_scope(Scope::HEAP_PROLOGUE),
           current_scope(Scope::HEAP_EPILOGUE),
-          current_scope(Scope::HEAP_EPILOGUE_REDUCE_NEW_SPACE),
           current_scope(Scope::HEAP_EXTERNAL_PROLOGUE),
           current_scope(Scope::HEAP_EXTERNAL_EPILOGUE),
           current_scope(Scope::HEAP_EXTERNAL_WEAK_GLOBAL_HANDLES),
-          current_scope(Scope::SCAVENGER_FAST_PROMOTE),
           current_scope(Scope::SCAVENGER_COMPLETE_SWEEP_ARRAY_BUFFERS),
           current_scope(Scope::SCAVENGER_SCAVENGE),
           current_scope(Scope::SCAVENGER_FREE_REMEMBERED_SET),
@@ -827,23 +869,24 @@ void GCTracer::PrintNVP() const {
           current_scope(Scope::SCAVENGER_SCAVENGE_UPDATE_REFS),
           current_scope(Scope::SCAVENGER_SWEEP_ARRAY_BUFFERS),
           current_scope(Scope::SCAVENGER_BACKGROUND_SCAVENGE_PARALLEL),
-          current_scope(Scope::BACKGROUND_UNMAPPER),
-          current_scope(Scope::UNMAPPER),
           incremental_scope(GCTracer::Scope::MC_INCREMENTAL).steps,
           current_scope(Scope::MC_INCREMENTAL),
-          ScavengeSpeedInBytesPerMillisecond(), current_.start_object_size,
-          current_.end_object_size, current_.start_holes_size,
-          current_.end_holes_size, allocated_since_last_gc,
-          heap_->promoted_objects_size(),
+          YoungGenerationSpeedInBytesPerMillisecond(
+              YoungGenerationSpeedMode::kOnlyAtomicPause)
+              .value_or(0.0),
+          current_.start_object_size, current_.end_object_size,
+          current_.start_holes_size, current_.end_holes_size,
+          allocated_since_last_gc, heap_->promoted_objects_size(),
           heap_->new_space_surviving_object_size(),
           heap_->nodes_died_in_new_space_, heap_->nodes_copied_in_new_space_,
           heap_->nodes_promoted_, heap_->promotion_ratio_,
           AverageSurvivalRatio(), heap_->promotion_rate_,
           heap_->new_space_surviving_rate_,
           NewSpaceAllocationThroughputInBytesPerMillisecond(),
-          heap_->memory_allocator()->unmapper()->NumberOfChunks());
+          heap_->memory_allocator()->pool()->NumberOfCommittedChunks());
       break;
     case Event::Type::MINOR_MARK_SWEEPER:
+    case Event::Type::INCREMENTAL_MINOR_MARK_SWEEPER:
       heap_->isolate()->PrintWithTimestamp(
           "pause=%.1f "
           "mutator=%.1f "
@@ -877,8 +920,6 @@ void GCTracer::PrintNVP() const {
           "background.mark=%.2f "
           "background.sweep=%.2f "
           "background.sweep.array_buffers=%.2f "
-          "background.unmapper=%.2f "
-          "unmapper=%.2f "
           "conservative_stack_scanning=%.2f "
           "total_size_before=%zu "
           "total_size_after=%zu "
@@ -924,8 +965,6 @@ void GCTracer::PrintNVP() const {
           current_scope(Scope::MINOR_MS_BACKGROUND_MARKING),
           current_scope(Scope::MINOR_MS_BACKGROUND_SWEEPING),
           current_scope(Scope::BACKGROUND_YOUNG_ARRAY_BUFFER_SWEEP),
-          current_scope(Scope::BACKGROUND_UNMAPPER),
-          current_scope(Scope::UNMAPPER),
           current_scope(Scope::CONSERVATIVE_STACK_SCANNING),
           current_.start_object_size, current_.end_object_size,
           current_.start_holes_size, current_.end_holes_size,
@@ -948,7 +987,6 @@ void GCTracer::PrintNVP() const {
           "heap.prologue=%.2f "
           "heap.embedder_tracing_epilogue=%.2f "
           "heap.epilogue=%.2f "
-          "heap.epilogue.reduce_new_space=%.2f "
           "heap.external.prologue=%.1f "
           "heap.external.epilogue=%.1f "
           "heap.external.weak_global_handles=%.1f "
@@ -961,8 +999,13 @@ void GCTracer::PrintNVP() const {
           "clear.slots_buffer=%.1f "
           "clear.weak_collections=%.1f "
           "clear.weak_lists=%.1f "
-          "clear.weak_references=%.1f "
+          "clear.weak_references_trivial=%.1f "
+          "clear.weak_references_non_trivial=%.1f "
+          "clear.weak_references_filter_non_trivial=%.1f "
+          "clear.js_weak_references=%.1f "
+          "clear.join_filter_job=%.1f"
           "clear.join_job=%.1f "
+          "weakness_handling=%.1f "
           "complete.sweep_array_buffers=%.1f "
           "complete.sweeping=%.1f "
           "epilogue=%.1f "
@@ -1003,7 +1046,6 @@ void GCTracer::PrintNVP() const {
           "incremental.layout_change=%.1f "
           "incremental.sweep_array_buffers=%.1f "
           "incremental.sweeping=%.1f "
-          "incremental.embedder_prologue=%.1f "
           "incremental.embedder_tracing=%.1f "
           "incremental_wrapper_tracing_longest_step=%.1f "
           "incremental_longest_step=%.1f "
@@ -1014,8 +1056,6 @@ void GCTracer::PrintNVP() const {
           "background.sweep=%.1f "
           "background.evacuate.copy=%.1f "
           "background.evacuate.update_pointers=%.1f "
-          "background.unmapper=%.1f "
-          "unmapper=%.1f "
           "conservative_stack_scanning=%.2f "
           "total_size_before=%zu "
           "total_size_after=%zu "
@@ -1032,7 +1072,7 @@ void GCTracer::PrintNVP() const {
           "promotion_rate=%.1f%% "
           "new_space_survive_rate=%.1f%% "
           "new_space_allocation_throughput=%.1f "
-          "unmapper_chunks=%d "
+          "pool_chunks=%zu "
           "compaction_speed=%.f\n",
           duration.InMillisecondsF(), spent_in_mutator.InMillisecondsF(),
           ToString(current_.type, true), current_.reduce_memory,
@@ -1040,7 +1080,6 @@ void GCTracer::PrintNVP() const {
           current_scope(Scope::HEAP_PROLOGUE),
           current_scope(Scope::HEAP_EMBEDDER_TRACING_EPILOGUE),
           current_scope(Scope::HEAP_EPILOGUE),
-          current_scope(Scope::HEAP_EPILOGUE_REDUCE_NEW_SPACE),
           current_scope(Scope::HEAP_EXTERNAL_PROLOGUE),
           current_scope(Scope::HEAP_EXTERNAL_EPILOGUE),
           current_scope(Scope::HEAP_EXTERNAL_WEAK_GLOBAL_HANDLES),
@@ -1053,8 +1092,13 @@ void GCTracer::PrintNVP() const {
           current_scope(Scope::MC_CLEAR_SLOTS_BUFFER),
           current_scope(Scope::MC_CLEAR_WEAK_COLLECTIONS),
           current_scope(Scope::MC_CLEAR_WEAK_LISTS),
-          current_scope(Scope::MC_CLEAR_WEAK_REFERENCES),
+          current_scope(Scope::MC_CLEAR_WEAK_REFERENCES_TRIVIAL),
+          current_scope(Scope::MC_CLEAR_WEAK_REFERENCES_NON_TRIVIAL),
+          current_scope(Scope::MC_CLEAR_WEAK_REFERENCES_FILTER_NON_TRIVIAL),
+          current_scope(Scope::MC_CLEAR_JS_WEAK_REFERENCES),
+          current_scope(Scope::MC_CLEAR_WEAK_REFERENCES_JOIN_FILTER_JOB),
           current_scope(Scope::MC_CLEAR_JOIN_JOB),
+          current_scope(Scope::MC_WEAKNESS_HANDLING),
           current_scope(Scope::MC_COMPLETE_SWEEP_ARRAY_BUFFERS),
           current_scope(Scope::MC_COMPLETE_SWEEPING),
           current_scope(Scope::MC_EPILOGUE), current_scope(Scope::MC_EVACUATE),
@@ -1093,7 +1137,6 @@ void GCTracer::PrintNVP() const {
           current_scope(Scope::MC_INCREMENTAL_LAYOUT_CHANGE),
           current_scope(Scope::MC_INCREMENTAL_START),
           current_scope(Scope::MC_INCREMENTAL_SWEEPING),
-          current_scope(Scope::MC_INCREMENTAL_EMBEDDER_PROLOGUE),
           current_scope(Scope::MC_INCREMENTAL_EMBEDDER_TRACING),
           incremental_scope(Scope::MC_INCREMENTAL_EMBEDDER_TRACING)
               .longest_step.InMillisecondsF(),
@@ -1106,8 +1149,6 @@ void GCTracer::PrintNVP() const {
           current_scope(Scope::MC_BACKGROUND_SWEEPING),
           current_scope(Scope::MC_BACKGROUND_EVACUATE_COPY),
           current_scope(Scope::MC_BACKGROUND_EVACUATE_UPDATE_POINTERS),
-          current_scope(Scope::BACKGROUND_UNMAPPER),
-          current_scope(Scope::UNMAPPER),
           current_scope(Scope::CONSERVATIVE_STACK_SCANNING),
           current_.start_object_size, current_.end_object_size,
           current_.start_holes_size, current_.end_holes_size,
@@ -1118,26 +1159,25 @@ void GCTracer::PrintNVP() const {
           AverageSurvivalRatio(), heap_->promotion_rate_,
           heap_->new_space_surviving_rate_,
           NewSpaceAllocationThroughputInBytesPerMillisecond(),
-          heap_->memory_allocator()->unmapper()->NumberOfChunks(),
-          CompactionSpeedInBytesPerMillisecond());
+          heap_->memory_allocator()->pool()->NumberOfCommittedChunks(),
+          CompactionSpeedInBytesPerMillisecond().value_or(0.0));
       break;
     case Event::Type::START:
       break;
-    default:
-      UNREACHABLE();
   }
 }
 
 void GCTracer::RecordIncrementalMarkingSpeed(size_t bytes,
                                              base::TimeDelta duration) {
+  DCHECK(!Event::IsYoungGenerationEvent(current_.type));
   if (duration.IsZero() || bytes == 0) return;
   double current_speed =
       static_cast<double>(bytes) / duration.InMillisecondsF();
-  if (recorded_incremental_marking_speed_ == 0) {
-    recorded_incremental_marking_speed_ = current_speed;
+  if (recorded_major_incremental_marking_speed_ == 0) {
+    recorded_major_incremental_marking_speed_ = current_speed;
   } else {
-    recorded_incremental_marking_speed_ =
-        (recorded_incremental_marking_speed_ + current_speed) / 2;
+    recorded_major_incremental_marking_speed_ =
+        (recorded_major_incremental_marking_speed_ + current_speed) / 2;
   }
 }
 
@@ -1151,28 +1191,23 @@ void GCTracer::RecordTimeToIncrementalMarkingTask(
   }
 }
 
-base::Optional<base::TimeDelta> GCTracer::AverageTimeToIncrementalMarkingTask()
+std::optional<base::TimeDelta> GCTracer::AverageTimeToIncrementalMarkingTask()
     const {
   return average_time_to_incremental_marking_task_;
 }
 
-void GCTracer::RecordEmbedderSpeed(size_t bytes, double duration) {
-  if (duration == 0 || bytes == 0) return;
-  double current_speed = bytes / duration;
-  if (recorded_embedder_speed_ == 0.0) {
-    recorded_embedder_speed_ = current_speed;
-  } else {
-    recorded_embedder_speed_ = (recorded_embedder_speed_ + current_speed) / 2;
-  }
+void GCTracer::RecordEmbedderMarkingSpeed(size_t bytes,
+                                          base::TimeDelta duration) {
+  recorded_embedder_marking_.Push(BytesAndDuration(bytes, duration));
 }
 
 void GCTracer::RecordMutatorUtilization(base::TimeTicks mark_compact_end_time,
                                         base::TimeDelta mark_compact_duration) {
-  const base::TimeDelta total_duration =
+  total_duration_since_last_mark_compact_ =
       mark_compact_end_time - previous_mark_compact_end_time_;
-  DCHECK_GE(total_duration, base::TimeDelta());
+  DCHECK_GE(total_duration_since_last_mark_compact_, base::TimeDelta());
   const base::TimeDelta mutator_duration =
-      total_duration - mark_compact_duration;
+      total_duration_since_last_mark_compact_ - mark_compact_duration;
   DCHECK_GE(mutator_duration, base::TimeDelta());
   if (average_mark_compact_duration_ == 0 && average_mutator_duration_ == 0) {
     // This is the first event with mutator and mark-compact durations.
@@ -1186,9 +1221,10 @@ void GCTracer::RecordMutatorUtilization(base::TimeTicks mark_compact_end_time,
         (average_mutator_duration_ + mutator_duration.InMillisecondsF()) / 2;
   }
   current_mark_compact_mutator_utilization_ =
-      !total_duration.IsZero() ? mutator_duration.InMillisecondsF() /
-                                     total_duration.InMillisecondsF()
-                               : 0;
+      !total_duration_since_last_mark_compact_.IsZero()
+          ? mutator_duration.InMillisecondsF() /
+                total_duration_since_last_mark_compact_.InMillisecondsF()
+          : 0;
   previous_mark_compact_end_time_ = mark_compact_end_time;
 }
 
@@ -1204,60 +1240,67 @@ double GCTracer::CurrentMarkCompactMutatorUtilization() const {
 }
 
 double GCTracer::IncrementalMarkingSpeedInBytesPerMillisecond() const {
-  if (recorded_incremental_marking_speed_ != 0) {
-    return recorded_incremental_marking_speed_;
+  if (recorded_major_incremental_marking_speed_ != 0) {
+    return recorded_major_incremental_marking_speed_;
   }
-  if (!incremental_marking_duration_.IsZero()) {
-    return incremental_marking_bytes_ /
-           incremental_marking_duration_.InMillisecondsF();
+  if (!current_.incremental_marking_duration.IsZero()) {
+    return current_.incremental_marking_bytes /
+           current_.incremental_marking_duration.InMillisecondsF();
   }
   return kConservativeSpeedInBytesPerMillisecond;
 }
 
-double GCTracer::EmbedderSpeedInBytesPerMillisecond() const {
-  // Note: Returning 0 is ok here as callers check for whether embedder speeds
-  // have been recorded at all.
-  return recorded_embedder_speed_;
+std::optional<double> GCTracer::EmbedderSpeedInBytesPerMillisecond() const {
+  return BoundedAverageSpeed(recorded_embedder_marking_);
 }
 
-double GCTracer::ScavengeSpeedInBytesPerMillisecond(
-    ScavengeSpeedMode mode) const {
-  if (mode == kForAllObjects) {
-    return BoundedAverageSpeed(recorded_minor_gcs_total_);
-  } else {
-    return BoundedAverageSpeed(recorded_minor_gcs_survived_);
+std::optional<double> GCTracer::YoungGenerationSpeedInBytesPerMillisecond(
+    YoungGenerationSpeedMode mode) const {
+  switch (mode) {
+    case YoungGenerationSpeedMode::kUpToAndIncludingAtomicPause:
+      return BoundedAverageSpeed(recorded_minor_gc_per_thread_);
+    case YoungGenerationSpeedMode::kOnlyAtomicPause:
+      return BoundedAverageSpeed(recorded_minor_gc_atomic_pause_);
   }
+  UNREACHABLE();
 }
 
-double GCTracer::CompactionSpeedInBytesPerMillisecond() const {
+std::optional<double> GCTracer::CompactionSpeedInBytesPerMillisecond() const {
   return BoundedAverageSpeed(recorded_compactions_);
 }
 
-double GCTracer::MarkCompactSpeedInBytesPerMillisecond() const {
+std::optional<double> GCTracer::MarkCompactSpeedInBytesPerMillisecond() const {
   return BoundedAverageSpeed(recorded_mark_compacts_);
 }
 
-double GCTracer::FinalIncrementalMarkCompactSpeedInBytesPerMillisecond() const {
+std::optional<double>
+GCTracer::FinalIncrementalMarkCompactSpeedInBytesPerMillisecond() const {
   return BoundedAverageSpeed(recorded_incremental_mark_compacts_);
 }
 
-double GCTracer::CombinedMarkCompactSpeedInBytesPerMillisecond() {
+std::optional<double> GCTracer::OldGenerationSpeedInBytesPerMillisecond() {
+  if (v8_flags.gc_speed_uses_counters) {
+    return BoundedAverageSpeed(recorded_major_totals_);
+  }
+
   const double kMinimumMarkingSpeed = 0.5;
   if (combined_mark_compact_speed_cache_ > 0)
     return combined_mark_compact_speed_cache_;
   // MarkCompact speed is more stable than incremental marking speed, because
   // there might not be many incremental marking steps because of concurrent
   // marking.
-  combined_mark_compact_speed_cache_ = MarkCompactSpeedInBytesPerMillisecond();
+  combined_mark_compact_speed_cache_ =
+      MarkCompactSpeedInBytesPerMillisecond().value_or(0.0);
   if (combined_mark_compact_speed_cache_ > 0)
     return combined_mark_compact_speed_cache_;
   double speed1 = IncrementalMarkingSpeedInBytesPerMillisecond();
-  double speed2 = FinalIncrementalMarkCompactSpeedInBytesPerMillisecond();
+  double speed2 =
+      FinalIncrementalMarkCompactSpeedInBytesPerMillisecond().value_or(0.0);
   if (speed1 < kMinimumMarkingSpeed || speed2 < kMinimumMarkingSpeed) {
     // No data for the incremental marking speed.
     // Return the non-incremental mark-compact speed.
     combined_mark_compact_speed_cache_ =
-        MarkCompactSpeedInBytesPerMillisecond();
+        MarkCompactSpeedInBytesPerMillisecond().value_or(0.0);
   } else {
     // Combine the speed of incremental step and the speed of the final step.
     // 1 / (1 / speed1 + 1 / speed2) = speed1 * speed2 / (speed1 + speed2).
@@ -1266,57 +1309,22 @@ double GCTracer::CombinedMarkCompactSpeedInBytesPerMillisecond() {
   return combined_mark_compact_speed_cache_;
 }
 
-double GCTracer::CombineSpeedsInBytesPerMillisecond(double default_speed,
-                                                    double optional_speed) {
-  constexpr double kMinimumSpeed = 0.5;
-  if (optional_speed < kMinimumSpeed) {
-    return default_speed;
-  }
-  return default_speed * optional_speed / (default_speed + optional_speed);
+double GCTracer::NewSpaceAllocationThroughputInBytesPerMillisecond() const {
+  return BoundedThroughput(new_generation_allocations_);
 }
 
-double GCTracer::NewSpaceAllocationThroughputInBytesPerMillisecond(
-    base::Optional<base::TimeDelta> selected_duration) const {
-  return BoundedAverageSpeed(
-      recorded_new_generation_allocations_,
-      selected_duration);
-}
-
-double GCTracer::OldGenerationAllocationThroughputInBytesPerMillisecond(
-    base::Optional<base::TimeDelta> selected_duration) const {
-  return BoundedAverageSpeed(
-      recorded_old_generation_allocations_,
-      selected_duration);
-}
-
-double GCTracer::EmbedderAllocationThroughputInBytesPerMillisecond(
-    base::Optional<base::TimeDelta> selected_duration) const {
-  return BoundedAverageSpeed(
-      recorded_embedder_generation_allocations_,
-      selected_duration);
-}
-
-double GCTracer::AllocationThroughputInBytesPerMillisecond(
-    base::Optional<base::TimeDelta> selected_duration) const {
-  return NewSpaceAllocationThroughputInBytesPerMillisecond(selected_duration) +
-         OldGenerationAllocationThroughputInBytesPerMillisecond(
-             selected_duration);
-}
-
-double GCTracer::CurrentAllocationThroughputInBytesPerMillisecond() const {
-  return AllocationThroughputInBytesPerMillisecond(kThroughputTimeFrame);
-}
-
-double GCTracer::CurrentOldGenerationAllocationThroughputInBytesPerMillisecond()
+double GCTracer::OldGenerationAllocationThroughputInBytesPerMillisecond()
     const {
-  return OldGenerationAllocationThroughputInBytesPerMillisecond(
-      kThroughputTimeFrame);
+  return BoundedThroughput(old_generation_allocations_);
 }
 
-double GCTracer::CurrentEmbedderAllocationThroughputInBytesPerMillisecond()
-    const {
-  return EmbedderAllocationThroughputInBytesPerMillisecond(
-      kThroughputTimeFrame);
+double GCTracer::EmbedderAllocationThroughputInBytesPerMillisecond() const {
+  return BoundedThroughput(embedder_generation_allocations_);
+}
+
+double GCTracer::AllocationThroughputInBytesPerMillisecond() const {
+  return NewSpaceAllocationThroughputInBytesPerMillisecond() +
+         OldGenerationAllocationThroughputInBytesPerMillisecond();
 }
 
 double GCTracer::AverageSurvivalRatio() const {
@@ -1333,7 +1341,7 @@ bool GCTracer::SurvivalEventsRecorded() const {
 void GCTracer::ResetSurvivalEvents() { recorded_survival_ratios_.Clear(); }
 
 void GCTracer::NotifyIncrementalMarkingStart() {
-  incremental_marking_start_time_ = base::TimeTicks::Now();
+  current_.incremental_marking_start_time = base::TimeTicks::Now();
 }
 
 void GCTracer::FetchBackgroundCounters() {
@@ -1371,15 +1379,10 @@ void GCTracer::RecordGCPhasesHistograms(RecordGCPhasesInfo::Mode mode) {
         TruncateToMs(current_.scopes[Scope::MC_PROLOGUE]));
     counters->gc_finalize_sweep()->AddSample(
         TruncateToMs(current_.scopes[Scope::MC_SWEEP]));
-    if (!incremental_marking_duration_.IsZero()) {
+    if (!current_.incremental_marking_duration.IsZero()) {
       heap_->isolate()->counters()->incremental_marking_sum()->AddSample(
-          TruncateToMs(incremental_marking_duration_));
+          TruncateToMs(current_.incremental_marking_duration));
     }
-    const base::TimeDelta overall_marking_time =
-        incremental_marking_duration_ + current_.scopes[Scope::MC_MARK];
-    heap_->isolate()->counters()->gc_marking_sum()->AddSample(
-        TruncateToMs(overall_marking_time));
-
     DCHECK_EQ(Scope::LAST_TOP_MC_SCOPE, Scope::MC_SWEEP);
   } else if (mode == RecordGCPhasesInfo::Mode::Scavenger) {
     counters->gc_scavenger_scavenge_main()->AddSample(
@@ -1395,7 +1398,7 @@ void GCTracer::RecordGCSumCounters() {
   const base::TimeDelta incremental_marking =
       incremental_scopes_[Scope::MC_INCREMENTAL_LAYOUT_CHANGE].duration +
       incremental_scopes_[Scope::MC_INCREMENTAL_START].duration +
-      incremental_marking_duration_ +
+      current_.incremental_marking_duration +
       incremental_scopes_[Scope::MC_INCREMENTAL_FINALIZE].duration;
   const base::TimeDelta incremental_sweeping =
       incremental_scopes_[Scope::MC_INCREMENTAL_SWEEPING].duration;
@@ -1418,6 +1421,9 @@ void GCTracer::RecordGCSumCounters() {
         background_scopes_[Scope::MC_BACKGROUND_MARKING];
   }
 
+  recorded_major_totals_.Push(
+      BytesAndDuration(current_.end_object_size, overall_duration));
+
   // Emit trace event counters.
   TRACE_EVENT_INSTANT2(
       TRACE_DISABLED_BY_DEFAULT("v8.gc"), "V8.GCMarkCompactorSummary",
@@ -1427,6 +1433,28 @@ void GCTracer::RecordGCSumCounters() {
       TRACE_DISABLED_BY_DEFAULT("v8.gc"), "V8.GCMarkCompactorMarkingSummary",
       TRACE_EVENT_SCOPE_THREAD, "duration", marking_duration.InMillisecondsF(),
       "background_duration", marking_background_duration.InMillisecondsF());
+  TRACE_EVENT_INSTANT2(TRACE_DISABLED_BY_DEFAULT("v8.gc"), "V8.GCSpeedSummary",
+                       TRACE_EVENT_SCOPE_THREAD, "old_generation_speed",
+                       OldGenerationSpeedInBytesPerMillisecond().value_or(0.0),
+                       "embedder_speed",
+                       EmbedderSpeedInBytesPerMillisecond().value_or(0.0));
+}
+
+void GCTracer::RecordGCSizeCounters() const {
+#if defined(V8_USE_PERFETTO)
+  TRACE_COUNTER(TRACE_DISABLED_BY_DEFAULT("v8.gc"),
+                perfetto::CounterTrack("OldGenerationConsumedBytes",
+                                       perfetto::ThreadTrack::Current()),
+                heap_->OldGenerationConsumedBytes());
+  TRACE_COUNTER(TRACE_DISABLED_BY_DEFAULT("v8.gc"),
+                perfetto::CounterTrack("GlobalConsumedBytes",
+                                       perfetto::ThreadTrack::Current()),
+                heap_->GlobalConsumedBytes());
+  TRACE_COUNTER(TRACE_DISABLED_BY_DEFAULT("v8.gc"),
+                perfetto::CounterTrack("ExternalMemoryBytes",
+                                       perfetto::ThreadTrack::Current()),
+                heap_->external_memory());
+#endif
 }
 
 namespace {
@@ -1525,11 +1553,12 @@ void GCTracer::ReportFullCycleToRecorder() {
 
   v8::metrics::GarbageCollectionFullCycle event;
   event.reason = static_cast<int>(current_.gc_reason);
+  event.priority = current_.priority;
 
   // Managed C++ heap statistics:
   if (cpp_heap) {
     cpp_heap->GetMetricRecorder()->FlushBatchedIncrementalEvents();
-    const base::Optional<cppgc::internal::MetricRecorder::GCCycle>
+    const std::optional<cppgc::internal::MetricRecorder::GCCycle>
         optional_cppgc_event =
             cpp_heap->GetMetricRecorder()->ExtractLastFullGcEvent();
     DCHECK(optional_cppgc_event.has_value());
@@ -1555,6 +1584,19 @@ void GCTracer::ReportFullCycleToRecorder() {
     DCHECK_NE(-1, cppgc_event.main_thread_efficiency_in_bytes_per_us);
     event.main_thread_efficiency_cpp_in_bytes_per_us =
         cppgc_event.main_thread_efficiency_in_bytes_per_us;
+
+    if (total_duration_since_last_mark_compact_.IsZero()) {
+      event.collection_weight_cpp_in_percent = 0;
+      event.main_thread_collection_weight_cpp_in_percent = 0;
+    } else {
+      event.collection_weight_cpp_in_percent =
+          static_cast<double>(event.total_cpp.total_wall_clock_duration_in_us) /
+          total_duration_since_last_mark_compact_.InMicroseconds();
+      event.main_thread_collection_weight_cpp_in_percent =
+          static_cast<double>(
+              event.main_thread_cpp.total_wall_clock_duration_in_us) /
+          total_duration_since_last_mark_compact_.InMicroseconds();
+    }
   }
 
   // Unified heap statistics:
@@ -1624,7 +1666,7 @@ void GCTracer::ReportFullCycleToRecorder() {
     event.main_thread_incremental.mark_wall_clock_duration_in_us =
         incremental_marking.InMicroseconds();
     event.incremental_marking_start_stop_wall_clock_duration_in_us =
-        (current_.start_time - incremental_marking_start_time_)
+        (current_.start_time - current_.incremental_marking_start_time)
             .InMicroseconds();
   } else {
     DCHECK(incremental_marking.IsZero());
@@ -1635,12 +1677,55 @@ void GCTracer::ReportFullCycleToRecorder() {
   event.main_thread_incremental.sweep_wall_clock_duration_in_us =
       incremental_sweeping.InMicroseconds();
 
-  // TODO(chromium:1154636): Populate the following:
-  // - event.objects
-  // - event.memory
-  // - event.collection_rate_in_percent
-  // - event.efficiency_in_bytes_per_us
-  // - event.main_thread_efficiency_in_bytes_per_us
+  // Objects:
+  event.objects.bytes_before = current_.start_object_size;
+  event.objects.bytes_after = current_.end_object_size;
+  event.objects.bytes_freed =
+      current_.start_object_size - current_.end_object_size;
+  // Memory:
+  event.memory.bytes_before = current_.start_memory_size;
+  event.memory.bytes_after = current_.end_memory_size;
+  event.memory.bytes_freed =
+      current_.start_memory_size > current_.end_memory_size
+          ? current_.start_memory_size - current_.end_memory_size
+          : 0U;
+  // Collection Rate:
+  if (event.objects.bytes_before == 0) {
+    event.collection_rate_in_percent = 0;
+  } else {
+    event.collection_rate_in_percent =
+        static_cast<double>(event.objects.bytes_freed) /
+        event.objects.bytes_before;
+  }
+  // Efficiency:
+  if (event.objects.bytes_freed == 0) {
+    event.efficiency_in_bytes_per_us = 0;
+    event.main_thread_efficiency_in_bytes_per_us = 0;
+  } else {
+    // Here, event.main_thread or even event.total can be
+    // zero if the clock resolution is not small enough and the entire GC was
+    // very short, so the timed value was zero. This appears to happen on
+    // Windows, see crbug.com/1338256 and crbug.com/1339180. In this case, we
+    // are only here if the number of freed bytes is nonzero and the division
+    // below produces an infinite value.
+    event.efficiency_in_bytes_per_us =
+        static_cast<double>(event.objects.bytes_freed) /
+        event.total.total_wall_clock_duration_in_us;
+    event.main_thread_efficiency_in_bytes_per_us =
+        static_cast<double>(event.objects.bytes_freed) /
+        event.main_thread.total_wall_clock_duration_in_us;
+  }
+  if (total_duration_since_last_mark_compact_.IsZero()) {
+    event.collection_weight_in_percent = 0;
+    event.main_thread_collection_weight_in_percent = 0;
+  } else {
+    event.collection_weight_in_percent =
+        static_cast<double>(event.total.total_wall_clock_duration_in_us) /
+        total_duration_since_last_mark_compact_.InMicroseconds();
+    event.main_thread_collection_weight_in_percent =
+        static_cast<double>(event.main_thread.total_wall_clock_duration_in_us) /
+        total_duration_since_last_mark_compact_.InMicroseconds();
+  }
 
   recorder->AddMainThreadEvent(event, GetContextId(heap_->isolate()));
 }
@@ -1655,7 +1740,7 @@ void GCTracer::ReportIncrementalMarkingStepToRecorder(double v8_duration) {
   if (!recorder->HasEmbedderRecorder()) return;
   incremental_mark_batched_events_.events.emplace_back();
   if (heap_->cpp_heap()) {
-    const base::Optional<
+    const std::optional<
         cppgc::internal::MetricRecorder::MainThreadIncrementalMark>
         cppgc_event = v8::internal::CppHeap::From(heap_->cpp_heap())
                           ->GetMetricRecorder()
@@ -1701,12 +1786,13 @@ void GCTracer::ReportYoungCycleToRecorder() {
   v8::metrics::GarbageCollectionYoungCycle event;
   // Reason:
   event.reason = static_cast<int>(current_.gc_reason);
+  event.priority = current_.priority;
 #if defined(CPPGC_YOUNG_GENERATION)
   // Managed C++ heap statistics:
   auto* cpp_heap = v8::internal::CppHeap::From(heap_->cpp_heap());
   if (cpp_heap && cpp_heap->generational_gc_supported()) {
     auto* metric_recorder = cpp_heap->GetMetricRecorder();
-    const base::Optional<cppgc::internal::MetricRecorder::GCCycle>
+    const std::optional<cppgc::internal::MetricRecorder::GCCycle>
         optional_cppgc_event = metric_recorder->ExtractLastYoungGcEvent();
     // We bail out from Oilpan's young GC if the full GC is already in progress.
     // Check here if the young generation event was reported.
@@ -1734,13 +1820,10 @@ void GCTracer::ReportYoungCycleToRecorder() {
 
   // Total:
   const base::TimeDelta total_wall_clock_duration =
-      current_.scopes[Scope::SCAVENGER] +
-      current_.scopes[Scope::MINOR_MARK_SWEEPER] +
-      current_.scopes[Scope::SCAVENGER_BACKGROUND_SCAVENGE_PARALLEL] +
-      current_.scopes[Scope::MINOR_MS_BACKGROUND_MARKING];
+      YoungGenerationWallTime(current_);
+
   // TODO(chromium:1154636): Consider adding BACKGROUND_YOUNG_ARRAY_BUFFER_SWEEP
-  // (both for the case of the scavenger and the minor mark-sweeper), and
-  // BACKGROUND_UNMAPPER (for the case of the minor mark-sweeper).
+  // (both for the case of the scavenger and the minor mark-sweeper).
   event.total_wall_clock_duration_in_us =
       total_wall_clock_duration.InMicroseconds();
   // MainThread:
@@ -1787,6 +1870,15 @@ GarbageCollector GCTracer::GetCurrentCollector() const {
     case Event::Type::START:
       UNREACHABLE();
   }
+}
+
+void GCTracer::UpdateCurrentEventPriority(GCTracer::Priority priority) {
+  // If the priority is changed, reset the priority field to denote a mixed
+  // priority cycle.
+  if (!current_.priority.has_value() || (current_.priority == priority)) {
+    return;
+  }
+  current_.priority = std::nullopt;
 }
 
 #ifdef DEBUG

@@ -175,12 +175,7 @@ class BaseTestRunner(object):
         tests = self._load_testsuite_generators(ctx, names)
         print(">>> Running tests for %s.%s" % (self.build_config.arch,
                                                self.mode_options.label))
-        exit_code = self._do_execute(tests, args, ctx)
-        if exit_code == utils.EXIT_CODE_FAILURES and self.options.json_test_results:
-          print("Force exit code 0 after failures. Json test results file "
-                "generated with failure information.")
-          exit_code = utils.EXIT_CODE_PASS
-      return exit_code
+        return self._do_execute(tests, args, ctx)
     except TestRunnerError:
       traceback.print_exc()
       return utils.EXIT_CODE_INTERNAL_ERROR
@@ -242,6 +237,10 @@ class BaseTestRunner(object):
                            "color, mono)")
     parser.add_option("--json-test-results",
                       help="Path to a file for storing json results.")
+    parser.add_option("--log-system-memory",
+                      help="Path to a file for storing system memory stats.")
+    parser.add_option("--log-test-schedule",
+                      help="Path to a file for streaming the test schedule to.")
     parser.add_option('--slow-tests-cutoff', type="int", default=100,
                       help='Collect N slowest tests')
     parser.add_option("--exit-after-n-failures", type="int", default=100,
@@ -306,6 +305,15 @@ class BaseTestRunner(object):
       print('Multiple architectures are deprecated')
       raise TestRunnerError()
 
+    # We write a test schedule and the system memory stats by default
+    # alongside json test results on bots.
+    if options.json_test_results:
+      result_dir = Path(options.json_test_results).parent
+      if not options.log_test_schedule:
+        options.log_test_schedule = result_dir / 'test_schedule.log'
+      if not options.log_system_memory:
+        options.log_system_memory = result_dir / 'memory_stats.log'
+
     return AugmentedOptions.augment(options), args
 
   def _load_build_config(self):
@@ -325,9 +333,6 @@ class BaseTestRunner(object):
       raise TestRunnerError
 
     print('Build found: %s' % self.outdir)
-    if str(self.build_config):
-      print('>>> Autodetected:')
-      print(self.build_config)
 
     # Represents the OS where tests are run on. Same as host OS except for
     # Android and iOS, which are determined by build output.
@@ -429,6 +434,7 @@ class BaseTestRunner(object):
 
     self.options.command_prefix = shlex.split(self.options.command_prefix)
     self.options.extra_flags = sum(list(map(shlex.split, self.options.extra_flags)), [])
+    self.options.extra_d8_flags = []
 
   def _process_options(self):
     pass # pragma: no cover
@@ -448,6 +454,10 @@ class BaseTestRunner(object):
           'allow_user_segv_handler=1',
           'allocator_may_return_null=1',
       ]
+      if self.build_config.component_build:
+        # Some abseil symbols are observed as defined more than once in
+        # component builds.
+        asan_options += ['detect_odr_violation=0']
       if not utils.GuessOS() in ['macos', 'windows']:
         # LSAN is not available on mac and windows.
         asan_options.append('detect_leaks=1')
@@ -522,10 +532,12 @@ class BaseTestRunner(object):
 
   def _load_testsuite_generators(self, ctx, names):
     test_config = self._create_test_config()
-    variables = self._get_statusfile_variables()
+    variables = self._get_statusfile_variables(ctx)
+    print('>>> Statusfile variables:')
+    print(', '.join(f'{k}={v}' for k, v in sorted(variables.items())))
 
     # Head generator with no elements
-    test_chain = testsuite.TestGenerator(0, [], [])
+    test_chain = testsuite.TestGenerator(0, [], [], [])
     for name in names:
       if self.options.verbose:
         print('>>> Loading test suite: %s' % name)
@@ -575,7 +587,7 @@ class BaseTestRunner(object):
 
     return False
 
-  def _get_statusfile_variables(self):
+  def _get_statusfile_variables(self, context):
     """Returns all attributes accessible in status files.
 
     All build-time flags from V8's BUILD.gn file as defined by the action
@@ -585,6 +597,7 @@ class BaseTestRunner(object):
     variables.update({
         "byteorder": sys.byteorder,
         "deopt_fuzzer": False,
+        "device_type": context.device_type,
         "endurance_fuzzer": False,
         "gc_fuzzer": False,
         "gc_stress": False,
@@ -612,8 +625,10 @@ class BaseTestRunner(object):
     return TestConfig(
         command_prefix=self.options.command_prefix,
         extra_flags=self.options.extra_flags,
+        extra_d8_flags=self.options.extra_d8_flags,
         framework_name=self.framework_name,
         isolates=self.options.isolates,
+        log_process_stats=self.options.json_test_results,
         mode_flags=self.mode_options.flags + self._runner_flags(),
         no_harness=self.options.no_harness,
         noi18n=not self.build_config.i18n,

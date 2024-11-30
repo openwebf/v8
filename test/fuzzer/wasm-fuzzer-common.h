@@ -10,10 +10,17 @@
 
 #include <memory>
 
-#include "src/wasm/module-decoder.h"
-#include "src/wasm/wasm-module-builder.h"
+#include "src/wasm/wasm-features.h"
+#include "src/wasm/wasm-module.h"
 
-namespace v8::internal::wasm::fuzzer {
+namespace v8::internal {
+class WasmInstanceObject;
+namespace wasm {
+class ZoneBuffer;
+}
+}  // namespace v8::internal
+
+namespace v8::internal::wasm::fuzzing {
 
 // A default value for {max_executed_instructions} in {ExecuteAgainstReference}.
 #ifdef USE_SIMULATOR
@@ -21,6 +28,8 @@ constexpr int kDefaultMaxFuzzerExecutedInstructions = 16'000;
 #else
 constexpr int kDefaultMaxFuzzerExecutedInstructions = 1'000'000;
 #endif
+
+CompileTimeImports CompileTimeImportsForFuzzing();
 
 // First creates a reference module fully compiled with Liftoff, with
 // instrumentation to stop after a given number of steps and to record any
@@ -32,8 +41,18 @@ void ExecuteAgainstReference(Isolate* isolate,
                              Handle<WasmModuleObject> module_object,
                              int32_t max_executed_instructions);
 
+Handle<WasmModuleObject> CompileReferenceModule(
+    Isolate* isolate, base::Vector<const uint8_t> wire_bytes,
+    int32_t* max_steps, int32_t* nondeterminism);
+
 void GenerateTestCase(Isolate* isolate, ModuleWireBytes wire_bytes,
                       bool compiles);
+
+// Validate a module containing a few wasm-gc types. This can be done to
+// prepulate the TypeCanonicalizer with a few canonical types, so that a
+// module-specific type index is more likely to be different from its canonical
+// type index.
+void AddDummyTypesToTypeCanonicalizer(Isolate* isolate, Zone* zone);
 
 // On the first call, enables all staged wasm features and experimental features
 // that are ready for fuzzing. All subsequent calls are no-ops. This avoids race
@@ -41,13 +60,15 @@ void GenerateTestCase(Isolate* isolate, ModuleWireBytes wire_bytes,
 // process anyway, so this should not interfere with anything.
 void EnableExperimentalWasmFeatures(v8::Isolate* isolate);
 
+constexpr int kMaxFuzzerInputSize = 512;
+
 class WasmExecutionFuzzer {
  public:
   virtual ~WasmExecutionFuzzer() = default;
   void FuzzWasmModule(base::Vector<const uint8_t> data,
                       bool require_valid = false);
 
-  virtual size_t max_input_size() const { return 512; }
+  virtual size_t max_input_size() const { return kMaxFuzzerInputSize; }
 
  protected:
   virtual bool GenerateModule(Isolate* isolate, Zone* zone,
@@ -55,5 +76,6 @@ class WasmExecutionFuzzer {
                               ZoneBuffer* buffer) = 0;
 };
 
-}  // namespace v8::internal::wasm::fuzzer
+}  // namespace v8::internal::wasm::fuzzing
+
 #endif  // WASM_FUZZER_COMMON_H_

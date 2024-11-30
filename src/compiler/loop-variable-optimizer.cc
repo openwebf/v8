@@ -5,10 +5,10 @@
 #include "src/compiler/loop-variable-optimizer.h"
 
 #include "src/compiler/common-operator.h"
-#include "src/compiler/graph.h"
 #include "src/compiler/node-marker.h"
 #include "src/compiler/node-properties.h"
 #include "src/compiler/node.h"
+#include "src/compiler/turbofan-graph.h"
 #include "src/zone/zone-containers.h"
 #include "src/zone/zone.h"
 
@@ -291,8 +291,8 @@ void LoopVariableOptimizer::ChangeToInductionVariablePhis() {
     InductionVariable* induction_var = entry.second;
     DCHECK_EQ(MachineRepresentation::kTagged,
               PhiRepresentationOf(induction_var->phi()->op()));
-    if (induction_var->upper_bounds().size() == 0 &&
-        induction_var->lower_bounds().size() == 0) {
+    if (induction_var->upper_bounds().empty() &&
+        induction_var->lower_bounds().empty()) {
       continue;
     }
     // Insert the increment value to the value inputs.

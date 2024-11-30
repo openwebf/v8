@@ -123,8 +123,7 @@ class V8_EXPORT_PRIVATE ErrorThrower {
  public:
   ErrorThrower(Isolate* isolate, const char* context)
       : isolate_(isolate), context_(context) {}
-  // Explicitly allow move-construction. Disallow copy.
-  ErrorThrower(ErrorThrower&& other) V8_NOEXCEPT;
+  // Disallow copy.
   ErrorThrower(const ErrorThrower&) = delete;
   ErrorThrower& operator=(const ErrorThrower&) = delete;
   ~ErrorThrower();
@@ -152,6 +151,8 @@ class V8_EXPORT_PRIVATE ErrorThrower {
 
   Isolate* isolate() const { return isolate_; }
 
+  constexpr const char* context_name() const { return context_; }
+
  private:
   enum ErrorType {
     kNone,
@@ -169,28 +170,14 @@ class V8_EXPORT_PRIVATE ErrorThrower {
 
   void Format(ErrorType error_type_, const char* fmt, va_list);
 
-  Isolate* isolate_;
-  const char* context_;
+  Isolate* const isolate_;
+  const char* const context_;
   ErrorType error_type_ = kNone;
   std::string error_msg_;
 
   // ErrorThrower should always be stack-allocated, since it constitutes a scope
   // (things happen in the destructor).
   DISALLOW_NEW_AND_DELETE()
-};
-
-// Like an ErrorThrower, but turns all pending exceptions into scheduled
-// exceptions when going out of scope. Use this in API methods.
-// Note that pending exceptions are not necessarily created by the ErrorThrower,
-// but e.g. by the wasm start function. There might also be a scheduled
-// exception, created by another API call (e.g. v8::Object::Get). But there
-// should never be both pending and scheduled exceptions.
-class V8_EXPORT_PRIVATE ScheduledErrorThrower : public ErrorThrower {
- public:
-  ScheduledErrorThrower(i::Isolate* isolate, const char* context)
-      : ErrorThrower(isolate, context) {}
-
-  ~ScheduledErrorThrower();
 };
 
 // Use {nullptr_t} as data value to indicate that this only stores the error,

@@ -56,8 +56,8 @@ class MaglevCompilationJob final : public OptimizedCompilationJob {
                         LocalIsolate* local_isolate) override;
   Status FinalizeJobImpl(Isolate* isolate) override;
 
-  Handle<JSFunction> function() const;
-  MaybeHandle<Code> code() const;
+  IndirectHandle<JSFunction> function() const;
+  MaybeIndirectHandle<Code> code() const;
   BytecodeOffset osr_offset() const;
   bool is_osr() const;
 
@@ -79,6 +79,8 @@ class MaglevCompilationJob final : public OptimizedCompilationJob {
                                 std::unique_ptr<MaglevCompilationInfo>&& info);
   void BeginPhaseKind(const char* name);
   void EndPhaseKind();
+  GlobalHandleVector<Map> CollectRetainedMaps(Isolate* isolate,
+                                              DirectHandle<Code> code);
 
   MaglevCompilationInfo* info() const { return info_.get(); }
 

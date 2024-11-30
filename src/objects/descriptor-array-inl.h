@@ -10,12 +10,14 @@
 #include "src/heap/heap-write-barrier.h"
 #include "src/heap/heap.h"
 #include "src/objects/descriptor-array.h"
+#include "src/objects/dictionary.h"
 #include "src/objects/field-type.h"
 #include "src/objects/heap-object-inl.h"
 #include "src/objects/lookup-cache-inl.h"
 #include "src/objects/maybe-object-inl.h"
 #include "src/objects/property.h"
 #include "src/objects/struct-inl.h"
+#include "src/objects/tagged-field-inl.h"
 #include "src/torque/runtime-macro-shims.h"
 #include "src/torque/runtime-support.h"
 
@@ -51,8 +53,66 @@ void DescriptorArray::CopyEnumCacheFrom(Tagged<DescriptorArray> array) {
 InternalIndex DescriptorArray::Search(Tagged<Name> name, int valid_descriptors,
                                       bool concurrent_search) {
   DCHECK(IsUniqueName(name));
-  return InternalIndex(internal::Search<VALID_ENTRIES>(
-      this, name, valid_descriptors, nullptr, concurrent_search));
+  SLOW_DCHECK_IMPLIES(!concurrent_search, IsSortedNoDuplicates());
+
+  if (valid_descriptors == 0) {
+    return InternalIndex::NotFound();
+  }
+
+  // Do linear search for small arrays, and for searches in the background
+  // thread.
+  const int kMaxElementsForLinearSearch = 8;
+  if (valid_descriptors <= kMaxElementsForLinearSearch || concurrent_search) {
+    return LinearSearch(name, valid_descriptors);
+  }
+
+  return BinarySearch(name, valid_descriptors);
+}
+
+InternalIndex DescriptorArray::BinarySearch(Tagged<Name> name,
+                                            int valid_descriptors) {
+  // We have to binary search all descriptors, not just valid ones, since the
+  // binary search ordering is across all descriptors.
+  int end = number_of_descriptors();
+  uint32_t hash = name->hash();
+
+  // Find the first descriptor whose key's hash is greater-than-or-equal-to the
+  // search hash.
+  int number = *std::ranges::lower_bound(std::views::iota(0, end), hash,
+                                         std::less<>(), [&](int i) {
+                                           Tagged<Name> entry = GetSortedKey(i);
+                                           return entry->hash();
+                                         });
+
+  // There may have been hash collisions, so search for the name from the first
+  // index until the first non-matching hash.
+  for (; number < end; ++number) {
+    InternalIndex index(GetSortedKeyIndex(number));
+    Tagged<Name> entry = GetKey(index);
+    if (entry == name) {
+      // If we found the entry, but it's outside the owned descriptors of the
+      // caller, return not found.
+      if (index.as_int() >= valid_descriptors) {
+        return InternalIndex::NotFound();
+      }
+      return index;
+    }
+    if (entry->hash() != hash) {
+      return InternalIndex::NotFound();
+    }
+  }
+
+  return InternalIndex::NotFound();
+}
+
+InternalIndex DescriptorArray::LinearSearch(Tagged<Name> name,
+                                            int valid_descriptors) {
+  DCHECK_LE(valid_descriptors, number_of_descriptors());
+  for (int i = 0; i < valid_descriptors; ++i) {
+    InternalIndex index(i);
+    if (GetKey(index) == name) return index;
+  }
+  return InternalIndex::NotFound();
 }
 
 InternalIndex DescriptorArray::Search(Tagged<Name> name, Tagged<Map> map,
@@ -125,7 +185,7 @@ Tagged<Name> DescriptorArray::GetKey(PtrComprCageBase cage_base,
                                      InternalIndex descriptor_number) const {
   DCHECK_LT(descriptor_number.as_int(), number_of_descriptors());
   int entry_offset = OffsetOfDescriptorAt(descriptor_number.as_int());
-  return Name::cast(
+  return Cast<Name>(
       EntryKeyField::Relaxed_Load(cage_base, *this, entry_offset));
 }
 
@@ -159,29 +219,29 @@ void DescriptorArray::SetSortedKey(int descriptor_number, int pointer) {
 Tagged<Object> DescriptorArray::GetStrongValue(
     InternalIndex descriptor_number) {
   PtrComprCageBase cage_base = GetPtrComprCageBase(*this);
-  return GetStrongValue(cage_base, descriptor_number);
+  return Cast<Object>(GetStrongValue(cage_base, descriptor_number));
 }
 
 Tagged<Object> DescriptorArray::GetStrongValue(
     PtrComprCageBase cage_base, InternalIndex descriptor_number) {
-  return GetValue(cage_base, descriptor_number).cast<Object>();
+  return Cast<Object>(GetValue(cage_base, descriptor_number));
 }
 
 void DescriptorArray::SetValue(InternalIndex descriptor_number,
-                               MaybeObject value) {
+                               Tagged<MaybeObject> value) {
   DCHECK_LT(descriptor_number.as_int(), number_of_descriptors());
   int entry_offset = OffsetOfDescriptorAt(descriptor_number.as_int());
   EntryValueField::Relaxed_Store(*this, entry_offset, value);
-  WEAK_WRITE_BARRIER(*this, entry_offset + kEntryValueOffset, value);
+  WRITE_BARRIER(*this, entry_offset + kEntryValueOffset, value);
 }
 
-MaybeObject DescriptorArray::GetValue(InternalIndex descriptor_number) {
+Tagged<MaybeObject> DescriptorArray::GetValue(InternalIndex descriptor_number) {
   PtrComprCageBase cage_base = GetPtrComprCageBase(*this);
   return GetValue(cage_base, descriptor_number);
 }
 
-MaybeObject DescriptorArray::GetValue(PtrComprCageBase cage_base,
-                                      InternalIndex descriptor_number) {
+Tagged<MaybeObject> DescriptorArray::GetValue(PtrComprCageBase cage_base,
+                                              InternalIndex descriptor_number) {
   DCHECK_LT(descriptor_number.as_int(), number_of_descriptors());
   int entry_offset = OffsetOfDescriptorAt(descriptor_number.as_int());
   return EntryValueField::Relaxed_Load(cage_base, *this, entry_offset);
@@ -215,12 +275,13 @@ Tagged<FieldType> DescriptorArray::GetFieldType(
 Tagged<FieldType> DescriptorArray::GetFieldType(
     PtrComprCageBase cage_base, InternalIndex descriptor_number) {
   DCHECK_EQ(GetDetails(descriptor_number).location(), PropertyLocation::kField);
-  MaybeObject wrapped_type = GetValue(cage_base, descriptor_number);
+  Tagged<MaybeObject> wrapped_type = GetValue(cage_base, descriptor_number);
   return Map::UnwrapFieldType(wrapped_type);
 }
 
 void DescriptorArray::Set(InternalIndex descriptor_number, Tagged<Name> key,
-                          MaybeObject value, PropertyDetails details) {
+                          Tagged<MaybeObject> value, PropertyDetails details) {
+  CHECK_LT(descriptor_number.as_int(), number_of_descriptors());
   SetKey(descriptor_number, key);
   SetDetails(descriptor_number, details);
   SetValue(descriptor_number, value);
@@ -228,7 +289,7 @@ void DescriptorArray::Set(InternalIndex descriptor_number, Tagged<Name> key,
 
 void DescriptorArray::Set(InternalIndex descriptor_number, Descriptor* desc) {
   Tagged<Name> key = *desc->GetKey();
-  MaybeObject value = *desc->GetValue();
+  Tagged<MaybeObject> value = *desc->GetValue();
   Set(descriptor_number, key, value, desc->GetDetails());
 }
 

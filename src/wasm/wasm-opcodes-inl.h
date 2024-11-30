@@ -136,6 +136,28 @@ constexpr bool WasmOpcodes::IsRelaxedSimdOpcode(WasmOpcode opcode) {
   return (opcode & 0xfff00) == 0xfd100;
 }
 
+constexpr bool WasmOpcodes::IsFP16SimdOpcode(WasmOpcode opcode) {
+  return (opcode >= kExprF16x8Splat && opcode <= kExprF16x8ReplaceLane) ||
+         (opcode >= kExprF16x8Abs && opcode <= kExprF16x8Qfms);
+}
+
+#if DEBUG
+// static
+constexpr bool WasmOpcodes::IsMemoryAccessOpcode(WasmOpcode opcode) {
+  switch (opcode) {
+#define MEM_OPCODE(name, ...) case WasmOpcode::kExpr##name:
+    FOREACH_LOAD_MEM_OPCODE(MEM_OPCODE)
+    FOREACH_STORE_MEM_OPCODE(MEM_OPCODE)
+    FOREACH_ATOMIC_OPCODE(MEM_OPCODE)
+    FOREACH_SIMD_MEM_OPCODE(MEM_OPCODE)
+    FOREACH_SIMD_MEM_1_OPERAND_OPCODE(MEM_OPCODE)
+    return true;
+    default:
+      return false;
+  }
+}
+#endif  // DEBUG
+
 constexpr uint8_t WasmOpcodes::ExtractPrefix(WasmOpcode opcode) {
   // See comment on {WasmOpcode} for the encoding.
   return (opcode > 0xffff) ? opcode >> 12 : opcode >> 8;
@@ -149,17 +171,18 @@ enum WasmOpcodeSig : uint8_t {
   FOREACH_SIGNATURE(DECLARE_SIG_ENUM)
 };
 #undef DECLARE_SIG_ENUM
-#define DECLARE_SIG(name, ...)                                                \
-  constexpr ValueType kTypes_##name[] = {__VA_ARGS__};                        \
-  constexpr int kReturnsCount_##name = kTypes_##name[0] == kWasmVoid ? 0 : 1; \
-  constexpr FunctionSig kSig_##name(                                          \
-      kReturnsCount_##name, static_cast<int>(arraysize(kTypes_##name)) - 1,   \
+#define DECLARE_SIG(name, ...)                                              \
+  constexpr inline ValueType kTypes_##name[] = {__VA_ARGS__};               \
+  constexpr inline int kReturnsCount_##name =                               \
+      kTypes_##name[0] == kWasmVoid ? 0 : 1;                                \
+  constexpr inline FunctionSig kSig_##name(                                 \
+      kReturnsCount_##name, static_cast<int>(arraysize(kTypes_##name)) - 1, \
       kTypes_##name + (1 - kReturnsCount_##name));
 FOREACH_SIGNATURE(DECLARE_SIG)
 #undef DECLARE_SIG
 
 #define DECLARE_SIG_ENTRY(name, ...) &kSig_##name,
-constexpr const FunctionSig* kCachedSigs[] = {
+constexpr inline const FunctionSig* kCachedSigs[] = {
     nullptr, FOREACH_SIGNATURE(DECLARE_SIG_ENTRY)};
 #undef DECLARE_SIG_ENTRY
 

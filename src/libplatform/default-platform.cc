@@ -198,7 +198,7 @@ void DefaultPlatform::RunIdleTasks(v8::Isolate* isolate,
 }
 
 std::shared_ptr<TaskRunner> DefaultPlatform::GetForegroundTaskRunner(
-    v8::Isolate* isolate) {
+    v8::Isolate* isolate, TaskPriority priority) {
   base::MutexGuard guard(&lock_);
   if (foreground_task_runner_map_.find(isolate) ==
       foreground_task_runner_map_.end()) {
@@ -242,8 +242,9 @@ bool DefaultPlatform::IdleTasksEnabled(Isolate* isolate) {
   return idle_task_support_ == IdleTaskSupport::kEnabled;
 }
 
-std::unique_ptr<JobHandle> DefaultPlatform::CreateJob(
-    TaskPriority priority, std::unique_ptr<JobTask> job_task) {
+std::unique_ptr<JobHandle> DefaultPlatform::CreateJobImpl(
+    TaskPriority priority, std::unique_ptr<JobTask> job_task,
+    const SourceLocation& location) {
   size_t num_worker_threads = NumberOfWorkerThreads();
   if (priority == TaskPriority::kBestEffort && num_worker_threads > 2) {
     num_worker_threads = 2;

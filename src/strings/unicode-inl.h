@@ -131,10 +131,11 @@ unsigned Utf8::EncodeOneByte(char* str, uint8_t c) {
   if (c <= kMaxOneByteChar) {
     str[0] = c;
     return 1;
+  } else {
+    str[0] = 0xC0 | (c >> 6);
+    str[1] = 0x80 | (c & kMask);
+    return 2;
   }
-  str[0] = 0xC0 | (c >> 6);
-  str[1] = 0x80 | (c & kMask);
-  return 2;
 }
 
 // Encode encodes the UTF-16 code units c and previous into the given str
@@ -176,7 +177,7 @@ unsigned Utf8::Encode(char* str, uchar c, int previous, bool replace_invalid) {
 }
 
 uchar Utf8::ValueOf(const uint8_t* bytes, size_t length, size_t* cursor) {
-  if (length <= 0) return kBadChar;
+  if (length == 0) return kBadChar;
   uint8_t first = bytes[0];
   // Characters between 0000 and 007F are encoded as a single character
   if (V8_LIKELY(first <= kMaxOneByteChar)) {
@@ -184,6 +185,14 @@ uchar Utf8::ValueOf(const uint8_t* bytes, size_t length, size_t* cursor) {
     return first;
   }
   return CalculateValue(bytes, length, cursor);
+}
+
+unsigned Utf8::LengthOneByte(uint8_t c) {
+  if (c <= kMaxOneByteChar) {
+    return 1;
+  } else {
+    return 2;
+  }
 }
 
 unsigned Utf8::Length(uchar c, int previous) {

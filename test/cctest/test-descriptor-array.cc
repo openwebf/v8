@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 #include "src/base/logging.h"
-#include "src/codegen/code-stub-assembler.h"
+#include "src/codegen/code-stub-assembler-inl.h"
 #include "src/common/globals.h"
 #include "src/objects/descriptor-array.h"
 #include "src/objects/property-details.h"
@@ -16,6 +16,8 @@
 
 namespace v8 {
 namespace internal {
+
+#include "src/codegen/define-code-stub-assembler-macros.inc"
 
 namespace {
 
@@ -40,9 +42,9 @@ template <typename... Args>
 MaybeHandle<Object> Call(Isolate* isolate, Handle<JSFunction> function,
                          Args... args) {
   const int nof_args = sizeof...(Args);
-  Handle<Object> call_args[] = {args...};
+  DirectHandle<Object> call_args[] = {args...};
   Handle<Object> receiver = isolate->factory()->undefined_value();
-  return Execution::Call(isolate, function, receiver, nof_args, call_args);
+  return Execution::Call(isolate, function, receiver, {call_args, nof_args});
 }
 
 void CheckDescriptorArrayLookups(Isolate* isolate, Handle<Map> map,
@@ -66,7 +68,7 @@ void CheckDescriptorArrayLookups(Isolate* isolate, Handle<Map> map,
   // Test CSA implementation.
   if (!v8_flags.jitless) {
     for (size_t i = 0; i < names.size(); ++i) {
-      Handle<Object> name_index =
+      DirectHandle<Object> name_index =
           Call(isolate, csa_lookup, map, names[i]).ToHandleChecked();
       CHECK(IsSmi(*name_index));
       CHECK_EQ(DescriptorArray::ToKeyIndex(static_cast<int>(i)),
@@ -99,12 +101,12 @@ void CheckTransitionArrayLookups(Isolate* isolate,
   // Test CSA implementation.
   if (!v8_flags.jitless) {
     for (size_t i = 0; i < maps.size(); ++i) {
-      Handle<Map> expected_map = maps[i];
+      DirectHandle<Map> expected_map = maps[i];
       Handle<Name> name(expected_map->instance_descriptors(isolate)->GetKey(
                             expected_map->LastAdded()),
                         isolate);
 
-      Handle<Object> transition_map =
+      DirectHandle<Object> transition_map =
           Call(isolate, csa_lookup, transitions, name).ToHandleChecked();
       CHECK(IsMap(*transition_map));
       CHECK_EQ(*expected_map, *transition_map);
@@ -191,7 +193,7 @@ Handle<JSFunction> CreateCsaTransitionArrayLookup(Isolate* isolate) {
                                       TransitionArray::kEntryKeyIndex) *
                                      kTaggedSize;
       TNode<Map> transition_map = m.CAST(m.GetHeapObjectAssumeWeak(
-          m.LoadArrayElement(transitions, WeakFixedArray::kHeaderSize,
+          m.LoadArrayElement(transitions, OFFSET_OF_DATA_START(WeakFixedArray),
                              var_name_index.value(), kKeyToTargetOffset)));
       m.Return(transition_map);
     }
@@ -420,6 +422,8 @@ TEST(TransitionArrayHashCollision) {
   transition_array->Sort();
   CheckTransitionArrayLookups(isolate, transition_array, maps, csa_lookup);
 }
+
+#include "src/codegen/undef-code-stub-assembler-macros.inc"
 
 }  // namespace internal
 }  // namespace v8

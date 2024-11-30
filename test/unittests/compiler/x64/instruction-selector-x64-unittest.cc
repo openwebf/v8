@@ -1050,7 +1050,7 @@ TEST_F(InstructionSelectorTest, Int32AddMinNegativeDisplacement) {
   // https://crbug.com/1091892. The key here is that we match on a
   // sequence like: Int32Add(Int32Sub(-524288, -2147483648), -26048), which
   // matches on an EmitLea, with -2147483648 as the displacement. Since we
-  // have a Int32Sub node, it sets kNegativeDisplacement, and later we try to
+  // have an Int32Sub node, it sets kNegativeDisplacement, and later we try to
   // negate -2147483648, which overflows.
   StreamBuilder m(this, MachineType::Int32());
   Node* const c0 = m.Int32Constant(-524288);
@@ -2087,6 +2087,7 @@ TEST_F(InstructionSelectorTest, LoadAndWord64ShiftRight32) {
   }
 }
 
+#if V8_ENABLE_WEBASSEMBLY
 // -----------------------------------------------------------------------------
 // SIMD.
 
@@ -2137,7 +2138,6 @@ TEST_F(InstructionSelectorTest, SIMDSplatZero) {
   }
 }
 
-#if V8_ENABLE_WEBASSEMBLY
 struct ArchShuffle {
   uint8_t shuffle[kSimd128Size];
   ArchOpcode arch_opcode;
@@ -2503,10 +2503,10 @@ INSTANTIATE_TEST_SUITE_P(InstructionSelectorTest,
 
 TEST_F(InstructionSelectorTest, F64x2PromoteLowF32x4WithS128Load64Zero) {
   StreamBuilder m(this, MachineType::Simd128(), MachineType::Int32());
-  Node* const load =
-      m.AddNode(m.machine()->LoadTransform(MemoryAccessKind::kProtected,
-                                           LoadTransformation::kS128Load64Zero),
-                m.Int32Constant(2), m.Parameter(0));
+  Node* const load = m.AddNode(
+      m.machine()->LoadTransform(MemoryAccessKind::kProtectedByTrapHandler,
+                                 LoadTransformation::kS128Load64Zero),
+      m.Int32Constant(2), m.Parameter(0));
   Node* const promote = m.AddNode(m.machine()->F64x2PromoteLowF32x4(), load);
   m.Return(promote);
   Stream s = m.Build();
@@ -2516,6 +2516,23 @@ TEST_F(InstructionSelectorTest, F64x2PromoteLowF32x4WithS128Load64Zero) {
   EXPECT_EQ(2U, s[0]->InputCount());
   EXPECT_EQ(1U, s[0]->OutputCount());
 }
+
+TEST_F(InstructionSelectorTest, SIMDF32x4SConvert) {
+  // Test optimization for F32x4UConvertI32x4.
+  // If the input of F32x4UConvertI32x4 is zero-extend from I16x8,
+  // F32x4SConvertI32x4 can be used, it's more efficient.
+  StreamBuilder m(this, MachineType::Simd128());
+  Node* const splat = m.I16x8Splat(m.Int32Constant(0xFFFF));
+  Node* const extend = m.AddNode(m.machine()->I32x4UConvertI16x8Low(), splat);
+  Node* const convert = m.AddNode(m.machine()->F32x4UConvertI32x4(), extend);
+  m.Return(convert);
+  Stream s = m.Build();
+  ASSERT_EQ(3U, s.size());
+  EXPECT_EQ(kX64F32x4SConvertI32x4, s[2]->arch_opcode());
+  ASSERT_EQ(1U, s[2]->InputCount());
+  EXPECT_EQ(1U, s[2]->OutputCount());
+}
+
 #endif  // V8_ENABLE_WEBASSEMBLY
 
 }  // namespace compiler

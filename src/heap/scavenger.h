@@ -9,9 +9,9 @@
 #include "src/heap/base/worklist.h"
 #include "src/heap/ephemeron-remembered-set.h"
 #include "src/heap/evacuation-allocator.h"
+#include "src/heap/heap-visitor.h"
 #include "src/heap/index-generator.h"
-#include "src/heap/memory-chunk.h"
-#include "src/heap/objects-visiting.h"
+#include "src/heap/mutable-page-metadata.h"
 #include "src/heap/parallel-work-item.h"
 #include "src/heap/pretenuring-handler.h"
 #include "src/heap/slot-set.h"
@@ -87,17 +87,16 @@ class Scavenger {
 
   using CopiedList =
       ::heap::base::Worklist<ObjectAndSize, kCopiedListSegmentSize>;
-  using EmptyChunksList = ::heap::base::Worklist<MemoryChunk*, 64>;
+  using EmptyChunksList = ::heap::base::Worklist<MutablePageMetadata*, 64>;
 
   Scavenger(ScavengerCollector* collector, Heap* heap, bool is_logging,
             EmptyChunksList* empty_chunks, CopiedList* copied_list,
             PromotionList* promotion_list,
-            EphemeronRememberedSet::TableList* ephemeron_table_list,
-            int task_id);
+            EphemeronRememberedSet::TableList* ephemeron_table_list);
 
   // Entry point for scavenging an old generation page. For scavenging single
   // objects see RootScavengingVisitor and ScavengeVisitor below.
-  void ScavengePage(MemoryChunk* page);
+  void ScavengePage(MutablePageMetadata* page);
 
   // Processes remaining work (=objects) after single objects have been
   // manually scavenged using ScavengeObject or CheckAndScavengeObject.
@@ -121,9 +120,9 @@ class Scavenger {
 
   inline Heap* heap() { return heap_; }
 
-  inline void PageMemoryFence(MaybeObject object);
+  inline void SynchronizePageAccess(Tagged<MaybeObject> object) const;
 
-  void AddPageToSweeperIfNecessary(MemoryChunk* page);
+  void AddPageToSweeperIfNecessary(MutablePageMetadata* page);
 
   // Potentially scavenges an object referenced from |slot| if it is
   // indeed a HeapObject and resides in from space.
@@ -131,11 +130,14 @@ class Scavenger {
   inline SlotCallbackResult CheckAndScavengeObject(Heap* heap, TSlot slot);
 
   template <typename TSlot>
-  inline void CheckOldToNewSlotForSharedUntyped(MemoryChunk* chunk, TSlot slot);
+  inline void CheckOldToNewSlotForSharedUntyped(MemoryChunk* chunk,
+                                                MutablePageMetadata* page,
+                                                TSlot slot);
   inline void CheckOldToNewSlotForSharedTyped(MemoryChunk* chunk,
+                                              MutablePageMetadata* page,
                                               SlotType slot_type,
                                               Address slot_address,
-                                              MaybeObject new_target);
+                                              Tagged<MaybeObject> new_target);
 
   // Scavenges an object |object| referenced from slot |p|. |object| is required
   // to be in from space.
@@ -202,19 +204,17 @@ class Scavenger {
 
   ScavengerCollector* const collector_;
   Heap* const heap_;
-  EmptyChunksList::Local empty_chunks_local_;
-  PromotionList::Local promotion_list_local_;
-  CopiedList::Local copied_list_local_;
-  EphemeronRememberedSet::TableList::Local ephemeron_table_list_local_;
-  PretenuringHandler* const pretenuring_handler_;
+  EmptyChunksList::Local local_empty_chunks_;
+  PromotionList::Local local_promotion_list_;
+  CopiedList::Local local_copied_list_;
+  EphemeronRememberedSet::TableList::Local local_ephemeron_table_list_;
   PretenuringHandler::PretenuringFeedbackMap local_pretenuring_feedback_;
-  size_t copied_size_;
-  size_t promoted_size_;
+  EphemeronRememberedSet::TableMap local_ephemeron_remembered_set_;
+  SurvivingNewLargeObjectsMap local_surviving_new_large_objects_;
+  size_t copied_size_{0};
+  size_t promoted_size_{0};
   EvacuationAllocator allocator_;
-  std::unique_ptr<ConcurrentAllocator> shared_old_allocator_;
-  SurvivingNewLargeObjectsMap surviving_new_large_objects_;
 
-  EphemeronRememberedSet::TableMap ephemeron_remembered_set_;
   const bool is_logging_;
   const bool is_incremental_marking_;
   const bool is_compacting_;
@@ -231,7 +231,8 @@ class Scavenger {
 // filtering out non-HeapObjects and objects which do not reside in new space.
 class RootScavengeVisitor final : public RootVisitor {
  public:
-  explicit RootScavengeVisitor(Scavenger* scavenger);
+  explicit RootScavengeVisitor(Scavenger& scavenger);
+  ~RootScavengeVisitor() final;
 
   void VisitRootPointer(Root root, const char* description,
                         FullObjectSlot p) final;
@@ -241,7 +242,7 @@ class RootScavengeVisitor final : public RootVisitor {
  private:
   void ScavengePointer(FullObjectSlot p);
 
-  Scavenger* const scavenger_;
+  Scavenger& scavenger_;
 };
 
 class ScavengerCollector {
@@ -256,12 +257,12 @@ class ScavengerCollector {
  private:
   class JobTask : public v8::JobTask {
    public:
-    explicit JobTask(
-        ScavengerCollector* outer,
-        std::vector<std::unique_ptr<Scavenger>>* scavengers,
-        std::vector<std::pair<ParallelWorkItem, MemoryChunk*>> memory_chunks,
-        Scavenger::CopiedList* copied_list,
-        Scavenger::PromotionList* promotion_list);
+    JobTask(ScavengerCollector* collector,
+            std::vector<std::unique_ptr<Scavenger>>* scavengers,
+            std::vector<std::pair<ParallelWorkItem, MutablePageMetadata*>>
+                old_to_new_chunks,
+            const Scavenger::CopiedList& copied_list,
+            const Scavenger::PromotionList& promotion_list);
 
     void Run(JobDelegate* delegate) override;
     size_t GetMaxConcurrency(size_t worker_count) const override;
@@ -272,15 +273,16 @@ class ScavengerCollector {
     void ProcessItems(JobDelegate* delegate, Scavenger* scavenger);
     void ConcurrentScavengePages(Scavenger* scavenger);
 
-    ScavengerCollector* outer_;
+    ScavengerCollector* collector_;
 
     std::vector<std::unique_ptr<Scavenger>>* scavengers_;
-    std::vector<std::pair<ParallelWorkItem, MemoryChunk*>> memory_chunks_;
+    std::vector<std::pair<ParallelWorkItem, MutablePageMetadata*>>
+        old_to_new_chunks_;
     std::atomic<size_t> remaining_memory_chunks_{0};
     IndexGenerator generator_;
 
-    Scavenger::CopiedList* copied_list_;
-    Scavenger::PromotionList* promotion_list_;
+    const Scavenger::CopiedList& copied_list_;
+    const Scavenger::PromotionList& promotion_list_;
 
     const uint64_t trace_id_;
   };
@@ -301,11 +303,19 @@ class ScavengerCollector {
 
   void IterateStackAndScavenge(
       RootScavengeVisitor* root_scavenge_visitor,
-      std::vector<std::unique_ptr<Scavenger>>* scavengers, int main_thread_id);
+      std::vector<std::unique_ptr<Scavenger>>* scavengers,
+      Scavenger& main_thread_scavenger);
+
+  size_t FetchAndResetConcurrencyEstimate() {
+    const size_t estimate =
+        estimate_concurrency_.exchange(0, std::memory_order_relaxed);
+    return estimate == 0 ? 1 : estimate;
+  }
 
   Isolate* const isolate_;
   Heap* const heap_;
   SurvivingNewLargeObjectsMap surviving_new_large_objects_;
+  std::atomic<size_t> estimate_concurrency_{0};
 
   friend class Scavenger;
 };

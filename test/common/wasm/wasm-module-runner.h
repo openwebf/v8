@@ -27,7 +27,7 @@ MaybeHandle<WasmExportedFunction> GetExportedFunction(
 // set and an exception occurs).
 int32_t CallWasmFunctionForTesting(
     Isolate* isolate, Handle<WasmInstanceObject> instance, const char* name,
-    base::Vector<Handle<Object>> args,
+    base::Vector<const DirectHandle<Object>> args,
     std::unique_ptr<const char[]>* exception = nullptr);
 
 // Decode, verify, and run the function labeled "main" in the
@@ -36,18 +36,17 @@ int32_t CompileAndRunWasmModule(Isolate* isolate, const uint8_t* module_start,
                                 const uint8_t* module_end);
 
 // Decode and compile the given module with no imports.
-MaybeHandle<WasmModuleObject> CompileForTesting(Isolate* isolate,
-                                                ErrorThrower* thrower,
-                                                ModuleWireBytes bytes);
+MaybeHandle<WasmModuleObject> CompileForTesting(
+    Isolate* isolate, ErrorThrower* thrower, base::Vector<const uint8_t> bytes);
 
 // Decode, compile, and instantiate the given module with no imports.
 MaybeHandle<WasmInstanceObject> CompileAndInstantiateForTesting(
-    Isolate* isolate, ErrorThrower* thrower, ModuleWireBytes bytes);
+    Isolate* isolate, ErrorThrower* thrower, base::Vector<const uint8_t> bytes);
 
 // Generate an array of default arguments for the given signature, to be used
 // when calling compiled code.
-base::OwnedVector<Handle<Object>> MakeDefaultArguments(Isolate* isolate,
-                                                       const FunctionSig* sig);
+DirectHandleVector<Object> MakeDefaultArguments(Isolate* isolate,
+                                                const FunctionSig* sig);
 
 // Install function map, module symbol for testing
 void SetupIsolateForWasmModule(Isolate* isolate);

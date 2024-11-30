@@ -77,7 +77,7 @@ MemOperand BaselineAssembler::FeedbackCellOperand() {
 void BaselineAssembler::Bind(Label* label) { __ bind(label); }
 
 void BaselineAssembler::JumpTarget() {
-  // NOP on x64.
+  __ endbr64();
 }
 
 void BaselineAssembler::Jump(Label* target, Label::Distance distance) {
@@ -377,13 +377,15 @@ void BaselineAssembler::LoadTaggedField(Register output, TaggedRegister source,
 void BaselineAssembler::LoadFixedArrayElement(Register output,
                                               TaggedRegister array,
                                               int32_t index) {
-  LoadTaggedField(output, array, FixedArray::kHeaderSize + index * kTaggedSize);
+  LoadTaggedField(output, array,
+                  OFFSET_OF_DATA_START(FixedArray) + index * kTaggedSize);
 }
 
 void BaselineAssembler::LoadFixedArrayElement(TaggedRegister output,
                                               TaggedRegister array,
                                               int32_t index) {
-  LoadTaggedField(output, array, FixedArray::kHeaderSize + index * kTaggedSize);
+  LoadTaggedField(output, array,
+                  OFFSET_OF_DATA_START(FixedArray) + index * kTaggedSize);
 }
 
 void BaselineAssembler::TryLoadOptimizedOsrCode(Register scratch_and_result,
@@ -422,7 +424,8 @@ void BaselineAssembler::AddToInterruptBudgetAndJumpIfNotExceeded(
 }
 
 void BaselineAssembler::LdaContextSlot(Register context, uint32_t index,
-                                       uint32_t depth) {
+                                       uint32_t depth,
+                                       CompressionMode compression_mode) {
   // [context] is coming from interpreter frame so it is already decompressed
   // when pointer compression is enabled. In order to make use of complex
   // addressing mode, any intermediate context pointer is loaded in compressed
@@ -439,6 +442,10 @@ void BaselineAssembler::LdaContextSlot(Register context, uint32_t index,
     }
     LoadTaggedField(kInterpreterAccumulatorRegister, tagged,
                     Context::OffsetOfElementAt(index));
+    if (COMPRESS_POINTERS_BOOL &&
+        compression_mode == CompressionMode::kForceDecompression) {
+      __ addq(tagged.reg(), kPtrComprCageBaseRegister);
+    }
   }
 }
 
@@ -517,16 +524,8 @@ void BaselineAssembler::StaModuleVariable(Register context, Register value,
   StoreTaggedFieldWithWriteBarrier(context, Cell::kValueOffset, value);
 }
 
-void BaselineAssembler::AddSmi(Register lhs, Tagged<Smi> rhs) {
-  if (rhs.value() == 0) return;
-  if (SmiValuesAre31Bits()) {
-    __ addl(lhs, Immediate(rhs));
-  } else {
-    ScratchRegisterScope scratch_scope(this);
-    Register rhs_reg = scratch_scope.AcquireScratch();
-    __ Move(rhs_reg, rhs);
-    __ addq(lhs, rhs_reg);
-  }
+void BaselineAssembler::IncrementSmi(MemOperand lhs) {
+  __ SmiAddConstant(lhs, Smi::FromInt(1));
 }
 
 void BaselineAssembler::Word32And(Register output, Register lhs, int rhs) {
@@ -574,25 +573,20 @@ void BaselineAssembler::EmitReturn(MacroAssembler* masm) {
   Register scratch = scope.AcquireScratch();
 
   Register actual_params_size = scratch;
-  // Compute the size of the actual parameters + receiver (in bytes).
+  // Compute the size of the actual parameters + receiver.
   __ masm()->movq(actual_params_size,
                   MemOperand(rbp, StandardFrameConstants::kArgCOffset));
 
   // If actual is bigger than formal, then we should use it to free up the stack
   // arguments.
-  Label corrected_args_count;
   __ masm()->cmpq(params_size, actual_params_size);
-  __ masm()->j(greater_equal, &corrected_args_count);
-  __ masm()->movq(params_size, actual_params_size);
-  __ Bind(&corrected_args_count);
+  __ masm()->cmovq(kLessThan, params_size, actual_params_size);
 
   // Leave the frame (also dropping the register file).
   __ masm()->LeaveFrame(StackFrame::BASELINE);
 
   // Drop receiver + arguments.
-  __ masm()->DropArguments(params_size, scratch,
-                           MacroAssembler::kCountIsInteger,
-                           MacroAssembler::kCountIncludesReceiver);
+  __ masm()->DropArguments(params_size, scratch);
   __ masm()->Ret();
 }
 
