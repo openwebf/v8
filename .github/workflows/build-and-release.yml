@@ -35,6 +35,7 @@ jobs:
         target_cpu = "arm64"
         v8_target_cpu = "arm64"
         target_os = "mac"
+        use_goma = false
         v8_enable_backtrace = true
         v8_enable_i18n_support = false
         v8_use_zlib = true

@@ -3258,6 +3258,7 @@ FastCloneObjectMode GetCloneModeForMapPreCheck(DirectHandle<Map> map,
                                                bool null_proto_literal,
                                                Isolate* isolate) {
   DisallowGarbageCollection no_gc;
+  bool null_proto_literal = flags & ObjectLiteral::kHasNullPrototype;
   if (!IsJSObjectMap(*map)) {
     // Everything that produces the empty object literal can be supported since
     // we have a special case for that.
